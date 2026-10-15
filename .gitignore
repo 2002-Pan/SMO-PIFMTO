@@ -20,6 +20,8 @@ data/
 outputs/
 results/
 logs/
+opt_logs/
+NN_TopOpt/opt_logs/
 checkpoints/
 rejected_candidates/
 *.vtu
@@ -34,3 +36,13 @@ topology_dataset_v1/
 topology_dataset_v2/
 rl_models/
 data_extruded_3d/
+
+# NHSDF components fetched locally by scripts/fetch_nhsdf_assets.py
+external/
+models/
+dataset_generation/
+model_weights/
+z_limits/
+configs/model/
+NN_TopOpt/mesh_utils.py
+test_problems/*.msh

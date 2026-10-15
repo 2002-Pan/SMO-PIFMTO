@@ -1,50 +1,50 @@
 # Source manifest
 
-## JAX-FEM development tree
+This manifest separates the paper-specific research artifact from external
+research dependencies.
 
-Source root: `/home/ubuntu/projects/jax-fem`
+## Paper-specific implementation
 
-- `simp_frontend/simpproblem.py` <- `simpproblem.py`
-- `simp_frontend/simpproblem_mask.py` <- `simpproblem_mask.py`
-- `bridge/density2feature.py` <- `density2feature.py`
-- `bridge/density2feature_mask.py` <- `density2feature_mask.py`
-- `configs/simp/*.yaml` <- selected `configs/problems/*.yaml`
-- `examples/smoke/jax_mbb_beam.pt` <- `test_samples/jax_mbb_beam.pt`
+The following tracked components contain the implementation and inputs used by
+the manuscript:
 
-Upstream Git revision: `0d767d1b686006781d21b98372936e58d6c49417`.
-The copied root-level research scripts were untracked in that Git worktree.
+- `simp_frontend/`: differentiable SIMP exploration and handover monitoring;
+- `bridge/`: density-to-feature fitting and prior construction;
+- `NN_TopOpt/NN_TopOpt.py`, `NN_TopOpt/TopOpt.py`,
+  `NN_TopOpt/shape_bridge.py`, and `NN_TopOpt/nntopo_example.py`: the FMTO
+  extensions, adaptive feature-space reopening, and experiment entry point;
+- `NN_TopOpt/mmapy2/`: the MMA implementation used by the modified optimizer;
+- `configs/simp/` and `configs/fmto/`: five manuscript benchmark inputs; and
+- `test_problems/problems.json`: paper-aligned support/load registry.
 
-## NHSDF development tree
+The SIMP and bridge files were developed in a local JAX-FEM worktree based on
+JAX-FEM revision `0d767d1b686006781d21b98372936e58d6c49417`. The FMTO files
+were developed from NHSDF-TOp and contain the paper-specific changes on top of
+that implementation.
 
-Source root: `/home/ubuntu/projects/NHSDF-TOp-main`
+## External NHSDF components
 
-- `NN_TopOpt/`, `models/`, and `dataset_generation/`: selected runtime source.
-- `configs/fmto/`: five selected quadrilateral FMTO configurations.
-- `configs/model/VAE_DeepSDF_quad.yaml`: neural architecture.
-- `test_problems/`: five meshes plus the registry.
-- `model_weights/frst_VAE_DeepSDF_quad_Bprec_full.pt`:
-  SHA-256 `1ba603ec9cae273ea9c98e2e60c1cafb7ecda8c22b8f08c5bcc03d15ba9f0d51`.
-- `z_limits/VAE_DeepSDF_quad_full_stats.npz`:
-  SHA-256 `687ab25873e0fe93ad518194bdb95ef452a23de7d44e425139e5b835a3689ee1`.
+The following unmodified NHSDF components are intentionally not tracked:
 
-The source root was not itself a Git repository, so no source commit is
-available for these files.
+- neural model definitions used at runtime;
+- geometry helper functions;
+- the quadrilateral neural-model configuration;
+- the pretrained quadrilateral model;
+- latent normalization statistics; and
+- the five benchmark mesh files.
 
-## Duplicate bridge candidate
+`scripts/fetch_nhsdf_assets.py` retrieves those files from
+<https://github.com/Alexander19970212/NHSDF-TOp> at commit
+`b5631e7bb20d98b6a8a55dd55856274b98825e9d` and verifies the checksums of the
+pretrained model and latent statistics before installing them into ignored
+local paths.
 
-The active `bridge/density2feature_mask.py` came from JAX-FEM and had source
-SHA-256 `88a0d97b9ab47270f5e64f47d0ed12368bb3a5c0b277e27603c923f58969e72f`.
-The later NHSDF variant is retained at
-`review_candidates/density2feature_mask_nhsdf.py` and had source SHA-256
-`449a4d15d36bbeec72e1c644bc19e4f8f2298cf0d5349c13574e731249310375`.
-Do not silently replace one with the other; compare outputs on all five tasks.
+## Staging adjustments
 
-## Staging-only modifications
-
-- Replaced hard-coded `/home/ubuntu/projects/...` paths in active SIMP and
-  bridge files with repository-relative paths.
-- Routed generated configurations and optimization output to ignored
-  `artifacts/` directories.
-- Added `FMTO_SIMP_CONFIG` and `FMTO_CONFIG` environment overrides.
-- Adjusted copied FMTO configuration paths to `configs/model/`.
-- Added package markers, documentation, validation, and Git metadata.
+- hard-coded development-machine paths were replaced with repository-relative
+  paths;
+- generated configurations and outputs were routed to ignored locations;
+- `FMTO_SIMP_CONFIG` and `FMTO_CONFIG` environment overrides were added;
+- the five SIMP YAML files and the support/load registry were aligned with the
+  manuscript benchmark definitions; and
+- documentation, dependency retrieval, validation, and Git metadata were added.
