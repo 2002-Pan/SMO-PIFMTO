@@ -1,0 +1,7 @@
+*.pt binary
+*.npz binary
+*.npy binary
+*.msh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf

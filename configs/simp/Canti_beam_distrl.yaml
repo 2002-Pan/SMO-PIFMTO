@@ -1,0 +1,24 @@
+name: Cant_beam_distrL
+meshfile: test_problems/Cantilever_beam_distributed_load.msh
+
+Lx: 1.0
+Ly: 0.5
+Nx: 100
+Ny: 50
+
+fixed_x: []
+fixed_y: []
+fixed_xy:
+  - [0.0, [0.0, 0.5]]
+
+loads:
+  - [[[0.0, 1.0], 0.5], [0.0, 0.0025]]
+
+vol_frac: 0.34
+filter_sigma: 1.0
+
+load_region_eps_x: 0.03
+load_region_eps_y: 0.03
+
+d2f_Lx: 0.5
+d2f_Ly: 0.25

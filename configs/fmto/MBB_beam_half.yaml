@@ -1,0 +1,157 @@
+params:
+  problem_name: MBB_beam_half
+  comment: 5 step Adamw
+  method: fm_nn_heaviside
+  top_opt_method: CombinedMappingDecoderSDF
+  penal: 3
+  sigmoid_limits: false
+  shape_combination: true
+  splitting: false
+  merging: false
+  reopen_use_shape_bridge: true
+  dens_interval: 40
+  dens_offset: 0
+  dens_start_iter: 40
+  cleaning_interval: 10
+  cleaning_offset: 5
+  merging_markers:
+  - 200
+  merging_adaptation: 1
+  axis_offset: 0.1
+  offset_grad_deceleration: 0.5
+  shape_optimization_ranges:
+  - - 10
+    - 400
+  refactoring_markers: []
+  volfrac: 0.5
+  volfrac_increment: 0.06
+  volfrac_increment_marker: 10
+  volfrac_increment_duration: 10
+  smooth_k: 15
+  N_cap: 5
+  N_g: 4
+  N_g_x: 4
+  N_g_y: 1
+  reopen_enable: true
+  reopen_start_iter: 30
+  reopen_patience: 5
+  reopen_improve_thresh: 0.015
+  reopen_cooldown: 8
+  reopen_adaptation: 5
+  reopen_offset_step: 0.13
+  reopen_scale_shrink: 0.5
+  reopen_use_canonical_shape_without_prior: true
+  reopen_force_zero_rotation_without_prior: true
+  reopen_canonicalize_old_feature_shapes: true
+  reopen_shrink_old_features: true
+  reopen_push_old_features: true
+  reopen_old_feature_canonical_blend: 0.4
+  reopen_old_feature_offset_canonical_blend: 0.4
+  reopen_direction_mode_without_prior: 8way
+  reopen_direction_probe_scale: 1.0
+  init_scale:
+  - 0.29365597282414624
+  - 0.35055778921504477
+  - 0.32205465689301416
+  - 0.36789007488413855
+  init_rotation:
+  - -2.7903173630029143
+  - 29.856358933722817
+  - -6.887250881363619
+  - 42.33085031595471
+  max_iter: 160
+  config_name: VAE_DeepSDF_quad
+  saved_model_name: frst_VAE_DeepSDF_quad_Bprec
+  config_dir: ../configs/model
+  input_dim: 10
+  dataset_type: quadrangle
+  merging_marker: 10
+  merging_adaptation_length: 10
+  compliance_w: 1200000000
+  volfrac_w: 3000000
+  gaussian_overlap_w: 0
+  gaussian_overlap_scale: 1.3
+  rc_loss_w: 100000
+  init_centers_x:
+  - 0.15419241168066294
+  - 0.42894393141117065
+  - 0.9268747480373967
+  - 1.1759970298576699
+  init_centers_y:
+  - 0.22609900528162616
+  - 0.36969841241482304
+  - 0.201274997702759
+  - 0.3800572199703487
+  init_chis:
+  - - -0.31603076927729706
+    - 0.31884928759479336
+    - -0.507516279328323
+    - 0.3100744005139979
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+  - - 0.8171414394618897
+    - 0.3296663075466718
+    - -0.73076454699575
+    - -0.5057059405141271
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+  - - -0.11734186208370524
+    - 0.2967843873629528
+    - -1.1784998093623482
+    - -0.2775952130042145
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+  - - 0.020322079623987577
+    - 0.07486556645756479
+    - -0.5905061488128173
+    - -0.4795936931538734
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+  init_split_confidence:
+  - 0.15420373058001313
+  - 0.1732924284886426
+  - 0.14405589158687154
+  - 0.17684057083695426
+  init_split_direction_x:
+  - -0.7945160789892333
+  - -0.9962110135161305
+  - -0.9968862316297674
+  - -0.769194954732913
+  init_split_direction_y:
+  - 0.6072431145987367
+  - 0.08696905512401602
+  - -0.07885328900560737
+  - 0.6390141795088995
+  init_split_distance_prior:
+  - 0.09814977932494595
+  - 0.14084233528615359
+  - 0.14670130970017595
+  - 0.10346169609466133
+  init_split_bimodal_score:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  init_split_neck_score:
+  - 0.5
+  - 0.4328472199427309
+  - 0.382111475378622
+  - 0.5494868270158828
+  init_split_anisotropy_score:
+  - 0.08407461160026253
+  - 0.8687652501164664
+  - 0.5884489794656986
+  - 0.23989045464378833
+  init_split_gray_score:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0

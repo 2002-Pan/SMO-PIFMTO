@@ -1,0 +1,24 @@
+# Staging dependency set. Lock exact versions after reproducing all five tasks.
+numpy<2
+scipy
+PyYAML
+matplotlib
+meshio
+gmsh
+tqdm
+pandas
+scikit-learn
+cvxpy
+prettytable
+torch
+torchvision
+lightning
+tensorboard
+tensorboardX
+torchviz
+
+# Inspected local upstream revision. Install a CUDA-compatible jax/jaxlib first
+# when the default wheel is not suitable for the target machine.
+jax
+jaxlib
+jax-fem @ git+https://github.com/deepmodeling/jax-fem.git@0d767d1b686006781d21b98372936e58d6c49417

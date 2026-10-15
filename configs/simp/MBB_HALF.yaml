@@ -1,0 +1,27 @@
+name: MBB_beam_half
+meshfile: test_problems/MBB_beam_half.msh
+
+Lx: 1.2
+Ly: 0.4
+Nx: 120
+Ny: 40
+
+fixed_x:
+  - [0.0, [0.0, 0.4]]
+
+fixed_y:
+  - [1.2, 0.0]
+
+fixed_xy: []
+
+loads:
+  - [[0.0, 0.4], [0.0, -0.0025]]
+
+vol_frac: 0.44
+filter_sigma: 1
+
+load_region_eps_x: 0.03
+load_region_eps_y: 0.03
+
+d2f_Lx: 0.6
+d2f_Ly: 0.2

@@ -1,0 +1,2068 @@
+import gmsh
+import numpy as np
+import torch
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
+from scipy import sparse
+import time
+import json
+from random import randint, randrange
+from scipy.sparse import linalg as sla
+from scipy.sparse import coo_matrix
+
+import os
+
+import cvxpy as cp
+
+# from NN_TopOpt.mesh_utils import LoadedMesh2D
+from mesh_utils import LoadedMesh2D
+from mmapy2.mma import _mmasub as mmasub
+# from mmapy import mmasub,subsolv
+
+def BuildIkFunc0():
+  return lambda me,k: np.array([2*me[k,0],2*me[k,0]+1,
+                                2*me[k,1],2*me[k,1]+1,
+                                2*me[k,2],2*me[k,2]+1])
+
+def Hooke2DP1(la, mu):
+    C=np.array([[la+2*mu, la , 0],
+                [la, la+2*mu, 0 ],
+                [0, 0, mu]])
+    return C
+
+def ElemStiffElasMatBa2DP1(ql,V,C):
+    #   https://www.math.univ-paris13.fr/~cuvelier/docs/Recherch/FEM2Dtoolbox/doc/V1.2b3/_elem_stiff_elas_mat_p1_ba_8m_source.html
+  """ Returns the element elastic stiffness matrix :math:`\\mathbb{K}^e(T)`
+  for a given tetrahedron :math:`T`  in the local *alternate* basis :math:`\\mathcal{B}_a`
+
+  :param ql: contains the four vertices of the tetrahedron,
+  :type ql: :math:`4 \\times 2` *numpy* array
+  :param V: volume of the tetrahedron
+  :type V: float
+  :param H: Elasticity tensor, :math:`\\mathbb{H}`.
+  :type H: :math:`6 \\times 6` *numpy* array
+  :returns: :math:`\\mathbb{K}^e(T)` in :math:`\\mathcal{B}_a` basis.
+  :type: :math:`12 \\times 12` *numpy* array of floats.
+  """
+  u=ql[1]-ql[2]
+  v=ql[2]-ql[0] 
+  w=ql[0]-ql[1]
+  
+  B= np.array([[u[1],  0 ,   v[1],  0,    w[1],  0],
+               [0,    -u[0], 0,    -v[0], 0,    -w[0]],
+               [-u[0], u[1], -v[0], v[1], -w[0], w[1]]])
+  
+  return np.dot(np.dot(B.T,C),B)/(4*V)
+
+GetI2DP1 = BuildIkFunc0()
+
+
+class TopOptimizer2D:
+    def __init__(self, method_dict, args, activate_method = True) -> None:
+        
+        self.problem_name = args['problem_name']
+        try:
+            self.image_size = args['image_size']
+        except:
+            self.image_size = 12
+        # load problems config
+        with open('../test_problems/problems.json', 'r') as fp:
+            problem_list = json.load(fp)
+
+        self.problem_args = problem_list[self.problem_name]
+
+        self.Th = LoadedMesh2D(f'../{self.problem_args["meshfile"]}')
+
+        self.volumes = self.Th.areas
+        self.volumes_sum = self.volumes.sum()
+        self.treshold = args.get('treshold', None)
+
+        # to save indeces and K_e for assembling global stiffness matrix
+        self.ik = []
+        self.jk = []
+        self.K_sep = []
+        self.edof = []
+
+        # to save boundary conditions and load
+        self.fixed_dof = []
+        self.loaded_dof = []
+        self.moved_dof = []
+
+        self.nme = self.Th.me.shape[0]   # number of elements
+        self.ndof = 2*self.Th.q.shape[0] # number of degrees of freedoms
+
+        self.u = np.zeros((self.ndof,))  # vector of displacments
+        self.f = np.zeros((self.ndof,))  # vector of loads
+        self.ce = np.ones(self.Th.me.shape[0]) # vector of compliances
+
+        # get Hooke matrix
+
+        youngs_modulus = 1.0
+        poissons_ratio = 0.3
+
+        # la = 1.5
+        # mu = 0.5
+        la = youngs_modulus * poissons_ratio / ((1 + poissons_ratio) * (1 - 2 * poissons_ratio))
+        mu = youngs_modulus / (2 * (1 + poissons_ratio))
+        
+        self.C=Hooke2DP1(la,mu)
+
+        self.build_stiffness_matrix()
+        self.build_constraints()
+        self.apply_loads()
+
+        # update initial conditions
+        self.dofs = np.arange(self.ndof)
+
+        self.fixed_dof = np.unique(np.array(self.fixed_dof))
+        self.moved_dof = np.array([])
+        self.moved_fixed_dof = np.concatenate((self.moved_dof, self.fixed_dof)).astype(int)
+        self.free_dof = np.setdiff1d(self.dofs, self.fixed_dof)
+        self.free_dof = np.setdiff1d(self.free_dof, self.moved_dof)
+
+        self.jk = np.array(self.jk)
+        self.ik = np.array(self.ik)
+        self.iK = self.ik.flatten()
+        self.jK = self.jk.flatten()
+        self.edof = np.array(self.edof, dtype=int)
+        self.K_sep = np.array(self.K_sep)
+
+        #for SIMP type methods
+        self.penal = args["penal"]
+        self.Emin = 0.0001
+        self.Emax = 1
+        self.obj = 0
+
+        if activate_method:
+            self.meth_args = {"Th": self.Th,
+                            "penal": self.penal,
+                            "args": args,
+                            "problem_config": self.problem_args,
+                            "Emin": self.Emin,
+                            "Emax": self.Emax}
+
+            self.method = method_dict[args['method']](self.meth_args)
+
+        ### initialize logger file
+        self.log_file_name = 'experiments/'+''.join(["{}".format(randint(0, 9)) for num in range(0, 10)])+'.json'
+        meta = {
+            'args': args,
+            'problem': self.problem_args,
+            'data': time.strftime("%Y-%m-%d"),
+            'time': time.strftime("%H:%M:%S", time.localtime()),
+            'iter_meta': {}
+        }
+
+        if not os.path.exists('experiments'):
+            os.makedirs('experiments')
+        
+        with open(self.log_file_name, 'w') as fp:
+            json.dump(meta, fp)
+
+        # print(self.log_file_name)
+        self.F_free_to_invest = None
+        self.K_free_to_invest = None
+
+    def build_stiffness_matrix(self):
+        # create the elasticity problem
+        for k in tqdm(range(self.Th.me.shape[0])): # iterate each element
+            # get stiffness matrix for element
+            E=ElemStiffElasMatBa2DP1(self.Th.q[self.Th.me[k]],self.Th.areas[k], self.C)
+
+            # get indeces of degrees of freedoms for the element
+            I=GetI2DP1(self.Th.me,k)
+
+            # to save indeces and K_e separately  
+            ik_e = []
+            jk_e = []
+            K_e = []
+            edof_e = []
+
+            # iterate elements in K_e to save them and their global indeces
+            # of dofs to assembly global stiffness matrix
+            for il in range(0,6):
+                i=I[il]
+                edof_e.append(i)
+
+                for jl in range(0,6):
+                    j=I[jl]
+                        
+                    ik_e.append(i)
+                    jk_e.append(j)
+                    K_e.append(E[il,jl])
+
+            # save elements of global stiffness matrix in separted form
+            self.ik.append(ik_e)
+            self.jk.append(jk_e)
+            self.K_sep.append(K_e)
+            self.edof.append(edof_e)
+
+    def build_constraints(self):
+        # split coords
+        node_range = np.arange(self.Th.q.shape[0])
+        
+        for fixed_case in ["fixed_x", "fixed_y", "fixed_xy"]:
+            
+            case_list = self.problem_args[fixed_case]
+            for case in case_list:
+                
+                # x component
+                if isinstance(case[0], list):
+                    x_bids = np.logical_and(self.Th.q[:, 0] >= case[0][0], self.Th.q[:, 0] <= case[0][1])
+                else:
+                    x_bids = np.isclose(self.Th.q[:, 0], case[0])
+
+                # y component
+                if isinstance(case[1], list):
+                    y_bids = np.logical_and(self.Th.q[:, 1] >= case[1][0], self.Th.q[:, 1] <= case[1][1])
+                else:
+                    y_bids = np.isclose(self.Th.q[:, 1], case[1])
+
+                bc_bids = np.logical_and(x_bids, y_bids)
+                print("Fixed case: ", fixed_case, case, bc_bids.sum(), y_bids.sum())
+                node_ids = node_range[bc_bids]
+
+                for node_id in node_ids:
+                    if fixed_case == "fixed_x":
+                        # print("Fixed_node_x: ", node_id)
+                        self.fixed_dof.append(2*node_id)
+                    elif fixed_case == "fixed_y":
+                        # print("Fixed_node_y: ", node_id)
+                        self.fixed_dof.append(2*node_id+1)
+                    else:
+                        # print("Fixed_node: ", node_id)
+                        self.fixed_dof.append(2*node_id)
+                        self.fixed_dof.append(2*node_id+1)
+
+    def apply_loads(self):
+        node_range = np.arange(self.Th.q.shape[0])
+        load_list = self.problem_args["loads"]
+
+        load_sum = 0
+        for case in load_list:
+            # x component
+            if isinstance(case[0][0], list):
+                x_bids = np.logical_and(self.Th.q[:, 0] >= case[0][0][0], self.Th.q[:, 0] <= case[0][0][1])
+            else:
+                x_bids = np.isclose(self.Th.q[:, 0], case[0][0])
+
+            # y component
+            if isinstance(case[0][1], list):
+                y_bids = np.logical_and(self.Th.q[:, 1] >= case[0][1][0], self.Th.q[:, 1] <= case[0][1][1])
+            else:
+                y_bids = np.isclose(self.Th.q[:, 1], case[0][1])
+
+            bc_bids = np.logical_and(x_bids, y_bids)
+            node_ids = node_range[bc_bids]
+
+            # apply loads distributed over nodes
+            self.f[node_ids*2] = case[1][0]/node_ids.shape[0]
+            self.f[node_ids*2+1] = case[1][1]/node_ids.shape[0]
+            
+            load_sum += case[1][0] + case[1][1]
+
+        print("Loaded loads: ", self.f[self.f != 0].shape)
+        print("Loaded loads sum: ", load_sum)
+
+    def update_meth_args(self):
+        self.meth_args["ce"] = self.ce
+
+    def log_meta(self):
+        iteration = self.method.global_i
+        iteration_meta = self.method.meta
+
+        # with open(self.log_file_name, 'r') as fp:
+        #     meta = json.load(fp)
+
+        # meta["iter_meta"][iteration] = iteration_meta
+
+        # with open(self.log_file_name, 'w') as fp:
+        #     json.dump(meta, fp)
+
+    def save_data(self, directory):
+        np.save(f"{directory}/K_sep.npy", self.K_sep)
+        np.save(f"{directory}/free_dof.npy", self.free_dof)
+        np.save(f"{directory}/moved_fixed_dof.npy", self.moved_fixed_dof)
+        np.save(f"{directory}/f.npy", self.f)
+        np.save(f"{directory}/ik.npy", self.ik)
+        np.save(f"{directory}/jk.npy", self.jk)
+
+    def plot_final_result(self,
+                          geometry_features=None,
+                          filename=None,
+                          zoom_center=None,
+                          zoom_radius=0.01,
+                          zoom_factor=3,
+                          plot_von_mises=True,
+                          ellipse_color='darkorange'):
+        
+        plot_args = {
+            "xPhys": self.x,
+            "image_size": self.image_size,
+            "geometry_features": geometry_features,
+            "filename": filename,
+            "zoom_center": zoom_center,
+            "zoom_radius": zoom_radius,
+            "zoom_factor": zoom_factor,
+            "ellipse_color": ellipse_color
+        }
+        if plot_von_mises:
+            plot_args["von_mises"] = self.von_mises
+
+        self.Th.plot_topology(**plot_args)
+         
+
+    def save_solution(self, directory):
+        np.save(f"{directory}/u.npy", self.u)
+        np.save(f"{directory}/x.npy", self.x)
+
+    def solve_linear_elasticity(self, xPhys):
+
+        # build global stiffness matrix
+        sK=(self.K_sep.T*(self.Emin+(xPhys)**self.penal*(self.Emax-self.Emin))).flatten(order='F')
+        K = coo_matrix((sK,(self.iK,self.jK)),shape=(self.ndof,self.ndof)).tocsc()
+
+        # compute RHS
+        # F_free = self.f[self.free_dof] - (K[self.free_dof,:][:,np.concatenate((self.moved_dof, self.fixed_dof)).astype(int)] @ self.u[np.concatenate((self.moved_dof, self.fixed_dof)).astype(int)])
+        F_free = self.f[self.free_dof] - (K[self.free_dof,:][:,self.moved_fixed_dof] @ self.u[self.moved_fixed_dof])
+        
+        K_free = K[self.free_dof,:][:,self.free_dof]
+
+        # compute SLE
+        K_free = K_free.tocsc() #  Need CSR for SuperLU factorisation
+        lu = sla.splu(K_free)
+        self.u[self.free_dof] = lu.solve(F_free)
+
+        for i, (edof_e, K_e_flatten) in enumerate(zip(self.edof, self.K_sep)): # iterate each element
+            u_e = self.u[edof_e] # vector of displacements for the element
+            K_e = K_e_flatten.reshape(6, 6) # upload K_e
+            self.ce[i] = np.dot(np.dot(u_e.T, K_e), u_e) # compute compliance for the element
+
+        self.obj=((self.Emin+xPhys**self.penal*(self.Emax-self.Emin))*self.ce).sum() # global compliance
+
+    
+    def optimize(self, plot_interval = 10):
+        self.log_meta()
+        counter = 0
+        while not self.method.stop_flag:
+            counter += 1
+            xPhys = self.method.get_x(self.meth_args)
+
+            self.solve_linear_elasticity(xPhys)
+            # show displacement
+            # self.Th.plot_displacement(self.u)
+            # break
+            if counter % plot_interval == 0:
+                if hasattr(self.method, 'gaussian_core'):
+                    features = self.method.gaussian_core.get_geometry()
+                else:
+                    features = None  # 或者根据上下文改成对应的空值/跳过逻辑
+                # self.Th.plot_topology(xPhys, image_size=self.image_size, geometry_features=features)
+                self.Th.plot_topology(xPhys, image_size=self.image_size)
+            reopened_flag = self.method.meta.get("reopened", 0)
+            if reopened_flag:
+                print(f"[Plot] Reopen happened at iteration {counter}, plotting topology.")
+                self.Th.plot_topology(xPhys, image_size=self.image_size)
+
+            # 可选：画完后清零，避免下一轮重复触发
+                self.method.meta["reopened"] = 0
+            # print("U max", self.u.max())
+            # compute compliance vector
+            # print("Compute compliance vecotor ...")
+            # print("Computer obj ...: ", self.obj)
+
+            self.log_meta()
+            self.update_meth_args()
+
+        if self.treshold is not None:
+            self.x = np.where(xPhys > self.treshold, 1, 0)
+        else:
+            self.x = xPhys
+
+        self.solve_linear_elasticity(self.x)
+
+        self.stresses = self.compute_stresses()
+        self.von_mises = self.compute_von_mises(self.stresses)
+
+        self.Th.plot_topology(self.x, von_mises=self.von_mises, image_size=self.image_size)
+
+    def compute_stresses(self):
+        """
+        Compute the stress tensor (stress vector components) for each element using the current
+        displacement field (self.u). For each element, the strain is calculated as
+            ε = B_std u_e,
+        where the standard strain–displacement matrix is given by
+            B_std = B / (2*Area),
+        and then the stress is computed using:
+            σ = C ε.
+            
+        Returns:
+            stresses: numpy.ndarray of shape (nme, 3)
+                Each row contains the stress components [sigma_x, sigma_y, tau_xy]
+                for the corresponding element.
+        """
+        stresses = []
+        for k in tqdm(range(self.nme), desc="Computing stresses"):
+            # Get nodal coordinates for element k 
+            # (ql: 3 x 2 array of node positions)
+            ql = self.Th.q[self.Th.me[k]]
+            area = self.Th.areas[k]
+            
+            # Compute the B matrix similar to ElemStiffElasMatBa2DP1 but without the final scaling.
+            # Here we use:
+            #   u_vec = ql[1]-ql[2],  v_vec = ql[2]-ql[0],  w_vec = ql[0]-ql[1]
+            # Then the rows of B are:
+            #   [y2-y3,    0,  y3-y1,    0,  y1-y2,    0]
+            #   [   0, -(x2-x3),    0, -(x3-x1),    0, -(x1-x2)]
+            #   [-(x2-x3), (y2-y3), -(x3-x1), (y3-y1), -(x1-x2), (y1-y2)]
+            u_vec = ql[1] - ql[2]
+            v_vec = ql[2] - ql[0]
+            w_vec = ql[0] - ql[1]
+            B = np.array([
+                [u_vec[1],     0,      v_vec[1],    0,      w_vec[1],     0],
+                [0,       -u_vec[0],    0,     -v_vec[0],    0,     -w_vec[0]],
+                [-u_vec[0],  u_vec[1],  -v_vec[0],  v_vec[1],  -w_vec[0],  w_vec[1]]
+            ])
+            
+            # Divide by (2 * area) to obtain the standard B matrix (i.e. shape function derivative terms)
+            B_std = B / (2 * area)
+            
+            # Get the element displacement vector using the precomputed edof list.
+            # u_e is a 6-component vector containing displacement components at the 3 nodes.
+            u_e = self.u[self.edof[k]]
+            
+            # Compute the strain vector: ε = B_std u_e.
+            epsilon = B_std.dot(u_e)
+            
+            # Compute stress: σ = C ε.
+            sigma = self.C.dot(epsilon)
+            stresses.append(sigma)
+            
+        return np.array(stresses)
+    
+    def compute_von_mises(self, stresses):
+        """
+        Compute the von Mises stress for each element based on the stress vector components.
+        
+        Parameters:
+            stresses: numpy.ndarray, shape (nme, 3)
+                Each row is [sigma_x, sigma_y, tau_xy].
+                
+        Returns:
+            von_mises: numpy.ndarray, shape (nme,)
+                The von Mises stress for each element.
+        """
+        sigma_x = stresses[:, 0]
+        sigma_y = stresses[:, 1]
+        tau_xy  = stresses[:, 2]
+        
+        # For plane stress, the von Mises stress is computed as:
+        #   sigma_vm = sqrt( sigma_x^2 - sigma_x*sigma_y + sigma_y^2 + 3*tau_xy^2 )
+        von_mises = np.sqrt(sigma_x**2 - sigma_x * sigma_y + sigma_y**2 + 3 * tau_xy**2)
+        return von_mises
+    
+
+    def load_solution_from_2d_tensor(self, filename, h_flopping=False, v_flopping=False, k=6):
+        self.xPhys_2d = np.load(filename)
+
+        min_x = np.round(self.Th.q[:, 0].min(), 2)
+        max_x = np.round(self.Th.q[:, 0].max(), 2)
+        min_y = np.round(self.Th.q[:, 1].min(), 2)
+        max_y = np.round(self.Th.q[:, 1].max(), 2)
+
+        # Compute the expected aspect ratio based on the physical domain dimensions
+        expected_ratio = (max_x - min_x) / (max_y - min_y)
+        # Get the current grid aspect ratio from the loaded 2D tensor (columns/rows)
+        grid_rows, grid_cols = self.xPhys_2d.shape
+        grid_ratio = grid_cols / grid_rows
+        # Check if the grid ratio matches the expected ratio within a relative tolerance
+        if not np.isclose(expected_ratio, grid_ratio, rtol=0.1):
+            print(f"[INFO] Aspect ratio mismatch detected: expected ratio {expected_ratio:.2f} vs grid ratio {grid_ratio:.2f}. Transposing xPhys_2d.")
+            self.xPhys_2d = self.xPhys_2d.T
+
+        if h_flopping:
+            self.xPhys_2d = np.flip(self.xPhys_2d, axis=1)
+        if v_flopping:
+            self.xPhys_2d = np.flip(self.xPhys_2d, axis=0)
+
+        # Determine the grid dimensions from the loaded 2D physical solution
+        grid_rows, grid_cols = self.xPhys_2d.shape  # rows correspond to y, cols to x
+
+        # Compute element centroids; if precomputed centroids exist use them, otherwise compute from nodal coordinates.
+        if hasattr(self.Th, 'centroids'):
+            centroids = self.Th.centroids
+        else:
+            centroids = np.array([np.mean(self.Th.q[self.Th.me[i]], axis=0) for i in range(self.Th.me.shape[0])])
+
+        # Initialize self.x to store the interpolated value for each element
+        xPhys = np.zeros(centroids.shape[0])
+
+        # For each element, map its centroid to the grid and compute the average of the four closest grid points.
+        for i, (x_coord, y_coord) in enumerate(centroids):
+            # Map physical coordinates to fractional grid indices using the provided limits.
+            col_f = (x_coord - min_x) / (max_x - min_x) * (grid_cols - 1)
+            row_f = (y_coord - min_y) / (max_y - min_y) * (grid_rows - 1)
+
+            # Compute Euclidean distances from the fractional grid position (row_f, col_f) to all grid points.
+            grid_rows, grid_cols = self.xPhys_2d.shape
+            rows = np.arange(grid_rows)
+            cols = np.arange(grid_cols)
+            # Create a meshgrid where grid_rows_mesh contains row indices and grid_cols_mesh contains column indices.
+            grid_cols_mesh, grid_rows_mesh = np.meshgrid(cols, rows)
+            # Flatten the meshgrid arrays.
+            flat_rows = grid_rows_mesh.ravel()
+            flat_cols = grid_cols_mesh.ravel()
+            # Compute distances from (row_f, col_f) to each grid point.
+            distances = np.sqrt((flat_rows - row_f)**2 + (flat_cols - col_f)**2)
+            # Identify the indices of the k nearest grid points.
+            nearest_indices = np.argsort(distances)[:k]
+            # Extract the corresponding values from the grid.
+            neighbor_values = self.xPhys_2d.ravel()[nearest_indices]
+            # Assign the average of these k nearest values to the current element.
+            xPhys[i] = np.mean(neighbor_values)
+
+        # self.xPhys = np.zeros((self.Th.nelems, self.Th.q.shape[0]))
+
+        if self.treshold is not None:
+            self.x = np.where(xPhys > self.treshold, 1, 0)
+        else:
+            self.x = xPhys
+        self.solve_linear_elasticity(self.x)
+
+        self.stresses = self.compute_stresses()
+        self.von_mises = self.compute_von_mises(self.stresses)
+
+        self.Th.plot_topology(self.x, von_mises=self.von_mises, image_size=self.image_size)
+
+    def print_metrics(self):
+        vf = (self.x.T @ self.volumes)/self.volumes_sum
+        compliance = self.obj
+        max_stress = np.max(self.von_mises)
+        print(f"vf: {vf:.6f} | compliance: {compliance:.6f} | max_stress: {max_stress:.6f}")
+
+        return vf, compliance, max_stress
+
+import numpy as np
+import scipy.sparse.linalg as sla
+from scipy.sparse import coo_matrix
+
+class TopOptimizer2D_Multi(TopOptimizer2D):
+    """
+    支持多载荷工况的拓扑优化求解器（用于交叉轴抑制比 CASR 等优化）
+    继承自 TopOptimizer2D，重写了初始化、载荷施加和有限元求解过程。
+    """
+    def __init__(self, method_dict, args, activate_method=True):
+        # 1. 提前初始化双工况的变量，防止父类 __init__ 调用 apply_loads 时找不到变量
+        # 注意：需要确保这些在父类调用 apply_loads 前存在。最安全的做法是先不要在父类里算，
+        # 但为了不改父类，我们利用 Python 的动态特性，先走一遍父类，再覆盖。
+        super().__init__(method_dict, args, activate_method=False)
+        
+        # 2. 覆盖单工况变量，拆分为主轴(_p)和交叉轴(_c)
+        self.u_p = np.zeros((self.ndof,))
+        self.u_c = np.zeros((self.ndof,))
+        self.f_p = np.zeros((self.ndof,))
+        self.f_c = np.zeros((self.ndof,))
+        self.ce_p = np.ones(self.Th.me.shape[0])
+        self.ce_c = np.ones(self.Th.me.shape[0])
+        
+        # 3. 重新施加载荷（重写后的方法）
+        self.apply_loads()
+        
+        # 4. 重新初始化神经网络方法
+        if activate_method:
+            self.meth_args = {"Th": self.Th,
+                              "penal": self.penal,
+                              "args": args,
+                              "problem_config": self.problem_args,
+                              "Emin": self.Emin,
+                              "Emax": self.Emax}
+            self.method = method_dict[args['method']](self.meth_args)
+
+    def apply_loads(self):
+        # 清零原有逻辑可能加上的载荷
+        if not hasattr(self, 'f_p'):
+            return 
+            
+        # 清零原有逻辑可能加上的载荷
+        self.f_p.fill(0)
+        self.f_c.fill(0)
+        
+        node_range = np.arange(self.Th.q.shape[0])
+        load_list = self.problem_args["loads"]
+
+        for idx, case in enumerate(load_list):
+            # x component
+            if isinstance(case[0][0], list):
+                x_bids = np.logical_and(self.Th.q[:, 0] >= case[0][0][0], self.Th.q[:, 0] <= case[0][0][1])
+            else:
+                x_bids = np.isclose(self.Th.q[:, 0], case[0][0])
+
+            # y component
+            if isinstance(case[0][1], list):
+                y_bids = np.logical_and(self.Th.q[:, 1] >= case[0][1][0], self.Th.q[:, 1] <= case[0][1][1])
+            else:
+                y_bids = np.isclose(self.Th.q[:, 1], case[0][1])
+
+            bc_bids = np.logical_and(x_bids, y_bids)
+            node_ids = node_range[bc_bids]
+
+            # idx 0 视为主轴，idx 1 视为交叉轴
+            if idx == 0:
+                self.f_p[node_ids*2] = case[1][0]/node_ids.shape[0]
+                self.f_p[node_ids*2+1] = case[1][1]/node_ids.shape[0]
+            elif idx == 1:
+                self.f_c[node_ids*2] = case[1][0]/node_ids.shape[0]
+                self.f_c[node_ids*2+1] = case[1][1]/node_ids.shape[0]
+
+        print("Loaded primary loads sum: ", self.f_p.sum())
+        print("Loaded cross loads sum: ", self.f_c.sum())
+
+    def solve_linear_elasticity(self, xPhys):
+        # 组装全局刚度矩阵
+        sK=(self.K_sep.T*(self.Emin+(xPhys)**self.penal*(self.Emax-self.Emin))).flatten(order='F')
+        K = coo_matrix((sK,(self.iK,self.jK)),shape=(self.ndof,self.ndof)).tocsc()
+
+        # 分别计算两个工况的右端项 (RHS)
+        F_free_p = self.f_p[self.free_dof] - (K[self.free_dof,:][:,self.moved_fixed_dof] @ self.u_p[self.moved_fixed_dof])
+        F_free_c = self.f_c[self.free_dof] - (K[self.free_dof,:][:,self.moved_fixed_dof] @ self.u_c[self.moved_fixed_dof])
+        
+        K_free = K[self.free_dof,:][:,self.free_dof].tocsc()
+        lu = sla.splu(K_free)
+        
+        # 求解两套位移
+        self.u_p[self.free_dof] = lu.solve(F_free_p)
+        self.u_c[self.free_dof] = lu.solve(F_free_c)
+
+        # 计算两套单元柔度
+        for i, (edof_e, K_e_flatten) in enumerate(zip(self.edof, self.K_sep)): 
+            K_e = K_e_flatten.reshape(6, 6)
+            u_e_p = self.u_p[edof_e]
+            u_e_c = self.u_c[edof_e]
+            self.ce_p[i] = np.dot(np.dot(u_e_p.T, K_e), u_e_p)
+            self.ce_c[i] = np.dot(np.dot(u_e_c.T, K_e), u_e_c)
+
+        # 计算全局柔度
+        self.obj_p = ((self.Emin+xPhys**self.penal*(self.Emax-self.Emin))*self.ce_p).sum()
+        self.obj_c = ((self.Emin+xPhys**self.penal*(self.Emax-self.Emin))*self.ce_c).sum()
+        
+        # 这里的 obj 主要是为了打印和日志记录
+        self.obj = self.obj_p + self.obj_c 
+
+    def update_meth_args(self):
+        # 【关键点】把两个 ce 打包成一个字典传给深度学习框架，避免修改框架的接口
+        self.meth_args["ce"] = {
+            "ce_p": self.ce_p,
+            "ce_c": self.ce_c
+        }
+
+class TopOptimizer2D_ADMM(TopOptimizer2D):
+    def __init__(self, method_dict, args, activate_method = True) -> None:
+        super().__init__(method_dict, args, activate_method)
+
+        self.gamma_1 = args["gamma_1"]
+        self.gamma_2 = args["gamma_2"]
+        self.gamma_3 = args["gamma_3"]
+
+        self.w = np.zeros((self.ndof,))  # vector of displacments
+        self.tilde_mu = np.zeros((self.ndof,))  # vector of displacments
+
+        self.gamma_3_I = self.gamma_3 * sparse.eye(self.ndof)
+
+        # self.K_sep_torch = torch.tensor(self.K_sep)
+        # self.indeces_K_torch = torch.tensor([self.iK, self.jK])
+        self.indeces_K = np.array([self.iK, self.jK])
+        
+        self.meth_args = {"Th": self.Th,
+                          "penal": self.penal,
+                          "args": args,
+                          "problem_config": self.problem_args,
+                          "Emin": self.Emin,
+                          "Emax": self.Emax,
+                          "ndof": self.ndof,
+                          "K_sep": self.K_sep,
+                          "indeces_K": self.indeces_K,
+                          "f": self.f}
+
+        self.method = method_dict[args['method']](self.meth_args)
+
+    def update_meth_args(self):
+        self.meth_args["ce"] = self.ce
+        self.meth_args["u"] = self.u
+
+    def optimize(self):
+        self.log_meta()
+        xPhys = self.method.x_init
+
+        while not self.method.stop_flag:
+            # update u
+            sK=(self.K_sep.T*(self.Emin+(xPhys)**self.penal*(self.Emax-self.Emin))).flatten(order='F')
+            K = coo_matrix((sK,(self.iK,self.jK)),shape=(self.ndof,self.ndof)).tocsc()
+
+            A = self.gamma_1*(K.T @ K) + self.gamma_3_I
+            # print("A: ", A.shape)
+            # print("K: ", K.shape)
+            # print("self.w: ", self.w.shape)
+            # print("self.tilde_mu: ", self.tilde_mu.shape)
+            RHS = self.gamma_2*(K.T @ self.f) + self.gamma_3*(self.w - self.tilde_mu)
+
+            RHS_free = RHS[self.free_dof] - (A[self.free_dof,:][:,self.moved_fixed_dof] @ self.u[self.moved_fixed_dof])            
+            A_free = A[self.free_dof,:][:,self.free_dof]
+
+            A_free = A_free.tocsc() #  Need CSR for SuperLU factorisation
+            lu = sla.splu(A_free)
+            self.u[self.free_dof] = lu.solve(RHS_free)
+
+            # update xPhys
+            self.update_meth_args()
+            xPhys = self.method.get_x(self.meth_args).detach().numpy()
+
+            # update w
+            self.w = -self.f/self.gamma_3 + self.u + self.tilde_mu
+
+            # update tilde_mu
+            self.tilde_mu = self.tilde_mu + self.gamma_3*(self.u - self.w)
+
+            self.Th.plot_topology(xPhys)
+            self.log_meta()
+            
+class TopOptimizer2D_LP(TopOptimizer2D):
+    def __init__(self, method_dict, args, activate_method = True) -> None:
+        super().__init__(method_dict, args, activate_method)
+
+        self.volumes = self.Th.areas
+        self.assemble_t()
+
+    def assemble_t(self):
+        t_list = []
+        for k in tqdm(range(self.nme), desc="Assembling t"):
+            sk=self.K_sep[k].T.flatten(order='F')
+            # print(sK.shape)
+            # print(self.iK.shape)
+            # print(self.ndof)
+            K = coo_matrix((sk,(self.ik[k],self.jk[k])),shape=(self.ndof,self.ndof)).tocsc()
+
+            # compute RHS
+            # print("compute RHS")
+            # F_free = self.f[self.free_dof] - (K[self.free_dof,:][:,np.concatenate((self.moved_dof, self.fixed_dof)).astype(int)] @ self.u[np.concatenate((self.moved_dof, self.fixed_dof)).astype(int)])
+            F_free = self.f[self.free_dof] - (K[self.free_dof,:][:,self.moved_fixed_dof] @ self.u[self.moved_fixed_dof])
+            K_free = K[self.free_dof,:][:,self.free_dof]
+
+            t = F_free.T @ K_free.T @ F_free
+
+            t_list.append(t)
+
+        self.t = np.array(t_list)
+
+        
+def oc(nme,x, v, vol_goal,dc,dv,g):
+    """
+    The function finds next X for optimization in SIMP method
+    and upadates optimality criterion.
+    """
+    l1=0
+    l2=1e9
+    move=0.2
+    # reshape to perform vector operations
+    xnew=np.zeros(nme)
+    while (l2-l1)/(l1+l2)>1e-3:
+        lmid=0.5*(l2+l1)
+        # print(lmid)
+        xnew= np.maximum(0.001,np.maximum(x-move,np.minimum(1.0,np.minimum(x+move,x*np.sqrt(-dc/dv/lmid)))))
+
+        # gt=g+np.sum((dv*(xnew-x)))
+        gt = np.sum(xnew * v) - vol_goal
+
+        if gt>0 :
+            l1=lmid
+        else:
+            l2=lmid
+    return xnew, gt
+
+def filter_matrix(points, rmin):
+
+  x_array = points[:, 0]
+  y_array = points[:, 1]
+
+  indeces = np.arange(points.shape[0])
+    
+  # H = sparse.csr_matrix((points.shape[0], points.shape[0]))
+  H = sparse.lil_matrix((points.shape[0], points.shape[0]))
+  print("Build filter matrix ...")
+  for i, point in enumerate(tqdm(points)):
+      x_c = point[0]
+      y_c = point[1]
+
+      x_c_r = (x_array <= x_c + rmin)
+      x_c_l = (x_array >= x_c - rmin)
+
+      y_c_r = (y_array <= y_c + rmin)
+      y_c_l = (y_array >= y_c - rmin)
+
+      result_mask = x_c_r & x_c_l & y_c_r & y_c_l
+
+      nearest_indeces = indeces[result_mask]
+      distances = np.sqrt((x_c - x_array[nearest_indeces])**2 + (y_c - y_array[nearest_indeces])**2)
+      fac = rmin - distances
+      sH_i = np.maximum(0.0,fac)
+
+      H[i, nearest_indeces] = sH_i
+
+  return H.tocsc()
+
+def fit_ellipsoid(x, target_area):
+    # Create variables: positive semi-definite matrix A and vector b
+    A = cp.Variable((2,2), PSD=True)
+    b = cp.Variable((2,))
+
+    # Form and solve the problem
+    prob = cp.Problem(cp.Minimize(-cp.log_det(A)), 
+                      [cp.norm(A @ x[i] + b) <= 1 for i in range(x.shape[0])])
+
+    prob.solve()
+
+    # Extract the optimal value of A
+    A_opt = A.value
+
+    # Calculate area of fitted ellipsoid
+    current_area = np.pi / np.sqrt(np.linalg.det(A_opt @ A_opt.T))
+
+    # Calculate scaling factor
+    scale_factor = np.sqrt(target_area / current_area)
+
+    # Scale A matrix to achieve target area
+    A_opt = A_opt / scale_factor
+
+    Q = A_opt @ A_opt.T
+
+    # Extract eigenvalues and eigenvectors
+    eigenvals, eigenvecs = np.linalg.eigh(Q)
+
+    # Sort eigenvalues and eigenvectors in descending order
+    idx = eigenvals.argsort()[::-1]
+    eigenvals = eigenvals[idx]
+    eigenvecs = eigenvecs[:,idx]
+
+    # Rotation matrix (eigenvectors)
+    R = eigenvecs
+
+    # Matrix of sigmas (square root of eigenvalues)
+    Sigmas = 1/np.sqrt(eigenvals)
+
+    # Center of the ellipsoid
+    center = np.linalg.inv(A_opt) @ b.value
+
+    return center, R, Sigmas
+
+import numpy as np
+import scipy.sparse as sp
+
+def filter_matrix_gaussian(centroids, sigma=0.0333):
+    """
+    为老代码替换的 2D 高斯滤波器矩阵生成函数
+    """
+    nme = centroids.shape[0]
+    # 为了保持稀疏矩阵的效率，我们只计算距离在 3个 sigma 以内的单元
+    # 超过 3*sigma 的高斯权重已经非常小，可以忽略不计
+    rmin = 3.0 * sigma 
+    
+    iH = np.ones(nme * nme, dtype=int)
+    jH = np.ones(nme * nme, dtype=int)
+    sH = np.zeros(nme * nme, dtype=float)
+    
+    cc = 0
+    for i in range(nme):
+        # 找到在 rmin 半径范围内的相邻单元
+        dist = np.linalg.norm(centroids - centroids[i, :], axis=1)
+        j = np.where(dist <= rmin)[0]
+        
+        # === 核心修改：使用高斯权重代替线性权重 ===
+        weight = np.exp(-0.5 * (dist[j] / sigma)**2)
+        # ==========================================
+        
+        iH[cc:cc+len(j)] = i
+        jH[cc:cc+len(j)] = j
+        sH[cc:cc+len(j)] = weight
+        cc += len(j)
+        
+    H = sp.coo_matrix((sH[:cc], (iH[:cc], jH[:cc])), shape=(nme, nme)).tocsr()
+    return H
+class SIMP_basic:
+    """
+    Basic SIMP method for topology optimization
+    """
+    def __init__(self, args) -> None:
+        self.Emin = args["Emin"]
+        self.Emax = args["Emax"]
+        self.penal = args["penal"]
+        self.volfrac = args["args"]["volfrac"]
+        self.rmin = args["args"]["rmin"]
+        self.Th = args["Th"]
+        self.nme = self.Th.me.shape[0]
+        self.x = self.volfrac * np.ones(self.Th.me.shape[0],dtype=float)
+        self.x_old = self.x.copy()
+
+        self.volumes = self.Th.areas
+        self.volumes_sum = self.volumes.sum()
+        self.vol_goal = self.volumes_sum*self.volfrac
+
+        self.dv = self.Th.areas/self.Th.areas.max()
+        print("check dv", (self.dv == 0).sum(), self.dv.mean())
+        self.dc = np.ones(self.Th.me.shape[0])
+        self.ce = np.ones(self.Th.me.shape[0])
+        self.g = 0
+
+        self.H = filter_matrix(self.Th.centroids, self.rmin)
+        self.Hs = self.H.sum(1)
+
+        self.stop_flag = False
+        self.obj = 0
+
+        self.global_i = 0
+        self.meta = {'x': self.x.copy().tolist(), 'dc': self.dc.copy().tolist(), 'stop_flag': self.stop_flag}
+
+    def get_x(self, args):
+
+        if self.global_i == 0:
+            self.global_i += 1
+            return self.x.copy()
+        
+        ce = args["ce"]
+        obj=((self.Emin+self.x**self.penal*(self.Emax-self.Emin))*ce).sum()
+
+        self.dc[:]=(-self.penal*self.x**(self.penal-1)*(self.Emax-self.Emin))*ce
+        self.dc[:] = np.asarray((self.H*(self.x*self.dc))[np.newaxis].T/self.Hs)[:,0] / np.maximum(0.001, self.x)
+
+        self.xold = self.x.copy()
+        self.x, self.g=oc(self.nme, self.x, self.volumes, self.vol_goal, self.dc, self.dv, self.g)
+        # print(self.x)
+        # H_vec = torch.clamp(self.H, min=self.Emin, max=self.Emax)**self.penal
+        # compliance = torch.dot(H_vec, ce.float())
+
+        # print("current volume: ", (self.x.T @ self.volumes)/self.volumes_sum)
+        # print("current c: ", obj)
+        print(f"Iteration: {self.global_i} | current volfrac: {(self.x.T @ self.volumes)/self.volumes_sum:.6f} | compliance: {obj:.6f}")
+
+        change=np.linalg.norm(self.x.reshape(self.nme,1)-self.xold.reshape(self.nme,1),np.inf)
+
+        self.global_i += 1
+        if self.global_i == 40:
+            self.stop_flag = True
+
+        self.meta = {'x': self.x.copy().tolist(),
+                     'ce': ce.copy().tolist(),
+                     'obj': obj,
+                     'dc': self.dc.copy().tolist(),
+                     'change': change,
+                     'stop_flag': self.stop_flag}
+        
+        # print(self.global_i, obj, change)
+
+        return self.x.copy()
+    
+class SIMP_MMA:
+    """
+    Basic SIMP method for topology optimization
+    """
+    def __init__(self, args) -> None:
+
+        self.Emin = args["Emin"]
+        self.Emax = args["Emax"]
+        self.penal = args["penal"]
+        self.volfrac = args["args"]["volfrac"]
+        self.rmin = args["args"]["rmin"]
+        self.Th = args["Th"]
+        self.nme = self.Th.me.shape[0]
+        self.x = self.volfrac * np.ones(self.Th.me.shape[0],dtype=float)
+        self.xPhys = self.x.copy()
+        # self.x_old = self.x.copy()
+
+        self.volumes = self.Th.areas
+        self.volumes_sum = self.volumes.sum()
+        self.vol_goal = self.volumes_sum*self.volfrac
+
+        self.dv = self.Th.areas/self.Th.areas.max()
+        print("check dv", (self.dv == 0).sum(), self.dv.mean())
+        self.dc = np.ones(self.Th.me.shape[0])
+        self.dv = np.ones(self.Th.me.shape[0])
+        self.ce = np.ones(self.Th.me.shape[0])
+        # self.g = 0
+
+        self.m = 1 
+        self.xmin = np.ones((self.nme,1))*self.Emin
+        self.xmax = np.ones((self.nme,1)) 
+        self.xval = self.x[np.newaxis].T 
+        self.xold1 = self.xval.copy() 
+        self.xold2 = self.xval.copy() 
+        self.low = np.ones((self.nme,1))
+        self.upp = np.ones((self.nme,1))
+        self.a0 = 1.0 
+        self.a = np.zeros((self.m,1)) 
+        self.c = 10000*np.ones((self.m,1))
+        self.d = np.zeros((self.m,1))
+        self.move = 0.05 
+
+        self.H = filter_matrix(self.Th.centroids, self.rmin)
+        self.Hs = self.H.sum(1)
+
+        self.stop_flag = False
+        self.obj = 0
+
+        self.global_i = 0
+        self.meta = {'x': self.x.copy().tolist(), 'dc': self.dc.copy().tolist(), 'stop_flag': self.stop_flag}
+        # 假设你的新代码 sigma=1.0 (如果你放大了网格，可能需要等比例放大 sigma，比如 2.0 或 3.0)
+        self.H = filter_matrix_gaussian(self.Th.centroids, sigma=0.01) 
+        self.Hs = np.asarray(self.H.sum(1)).flatten()
+    # def get_x(self, args):
+
+    #     if self.global_i == 0:
+    #         self.global_i += 1
+    #         return self.x.copy()
+        
+    #     ce = args["ce"]
+    #     obj = ((self.Emin + self.xPhys**self.penal * (self.Emax - self.Emin)) * ce).sum()
+
+    #     self.dc[:]=(-self.penal*self.xPhys**(self.penal-1)*(self.Emax-self.Emin))*ce
+    #     self.dv[:] = np.ones(self.nme)
+
+    #     # self.dc[:] = np.asarray((self.H*(self.xPhys*self.dc))[np.newaxis].T/self.Hs)[:,0] / np.maximum(0.001, self.xPhys)
+    #     # filtered_dc = self.H @ (self.x * self.dc)
+    #     # # 将 self.Hs 临时压平参与计算
+    #     # self.dc[:] = (filtered_dc / np.asarray(self.Hs).flatten()) / np.maximum(0.001, self.x)
+    #     # 【新增】1. 密度滤波：物理密度 xPhys 由设计变量 x 滤波得到
+    #     self.xPhys[:] = (self.H @ self.x) / self.Hs
+
+    #     # 【新增】2. 计算目标函数时，必须使用 xPhys
+    #     obj = ((self.Emin + self.xPhys**self.penal * (self.Emax - self.Emin)) * ce).sum()
+
+    #     # 【新增】3. 计算基于 xPhys 的原始灵敏度
+    #     dc_raw = (-self.penal * self.xPhys**(self.penal-1) * (self.Emax - self.Emin)) * ce
+
+    #     # 【新增】4. 链式法则：将偏导数反向滤波回设计变量 x
+    #     self.dc[:] = (self.H @ dc_raw) / self.Hs
+    #     # self.dc[:] = np.asarray(self.H*(self.dc[np.newaxis].T/self.Hs))[:,0]
+    #     # self.dv[:] = np.asarray(self.H*(self.dv[np.newaxis].T/self.Hs))[:,0]
+
+    #     # self.xold = self.x.copy()
+
+    #     mu0 = 20.0 # Scale factor for objective function
+    #     mu1 = 1.0 # Scale factor for volume constraint function
+    #     f0val = mu0*obj 
+    #     df0dx = mu0*self.dc[np.newaxis].T
+    #     # 计算实际的体积分数
+    #     actual_volfrac = (self.xPhys.T @ self.volumes) / self.volumes_sum
+
+    #     # 约束函数值：实际体积分数 - 目标体积分数
+    #     fval = mu1 * np.array([[actual_volfrac - self.volfrac]])
+
+    #     # 约束函数对 x 的偏导数：vi / V_total
+    #     dfdx = mu1 * (self.volumes / self.volumes_sum)[np.newaxis]
+    #     self.xval = self.x.copy()[np.newaxis].T 
+    #     xmma,ymma,zmma,lam,xsi,eta,mu,zet,s,self.low,self.upp = mmasub(self.m,self.nme,200,
+    #                                                          self.xval,self.xmin,self.xmax,
+    #                                                          self.xold1,self.xold2,f0val,
+    #                                                          df0dx,fval,dfdx,
+    #                                                          self.low,self.upp,
+    #                                                          self.a0,self.a,self.c,self.d,self.move)
+    #     self.xold2 = self.xold1.copy()
+    #     self.xold1 = self.xval.copy()
+    #     self.x = xmma.copy().flatten()
+
+    #     self.xPhys[:] = self.x
+    #     # self.xPhys[:] = np.asarray(self.H*self.x[np.newaxis].T/self.Hs)[:,0]
+    #     # self.x, self.g=oc(self.nme, self.x, self.volumes, self.vol_goal, self.dc, self.dv, self.g)
+    #     # print(self.x)
+    #     # H_vec = torch.clamp(self.H, min=self.Emin, max=self.Emax)**self.penal
+    #     # compliance = torch.dot(H_vec, ce.float())
+
+    #     # print("current volume: ", (self.x.T @ self.volumes)/self.volumes_sum)
+    #     # print("current c: ", obj)
+    #     print(f"Iteration: {self.global_i} | current volfrac: {(self.x.T @ self.volumes)/self.volumes_sum:.6f} | compliance: {obj:.6f}")
+
+    #     change=np.linalg.norm(self.x.reshape(self.nme,1)-self.xold1.reshape(self.nme,1),np.inf)
+
+
+    #     self.global_i += 1
+    #     if self.global_i == 200:
+    #         self.stop_flag = True
+
+    #     self.meta = {'x': self.x.copy().tolist(),
+    #                  'ce': ce.copy().tolist(),
+    #                  'obj': obj,
+    #                  'dc': self.dc.copy().tolist(),
+    #                  'change': change,
+    #                  'stop_flag': self.stop_flag}
+        
+    #     # print(self.global_i, obj, change)
+
+    #     return self.x.copy()
+    def get_x(self, args):
+        if self.global_i == 0:
+            self.global_i += 1
+            return self.x.copy()
+        
+        ce = args["ce"]
+        
+        # ==========================================
+        # 1. Heaviside 参数控制 (延续法 Continuation)
+        # ==========================================
+        # beta 从 1 开始，每 40 步翻倍，最高到 32 封顶
+        # 这样能保证前期有梯度，后期边缘极度锐利
+        beta = 1.0 * (2 ** (self.global_i // 40))
+        beta = min(beta, 32.0)
+        eta = 0.5  # 投影阈值
+        
+        # ==========================================
+        # 2. 正向物理投影：x -> x_tilde -> xPhys
+        # ==========================================
+        # A. 密度滤波 (x_tilde)
+        x_tilde = (self.H @ self.x) / self.Hs
+        
+        # B. Heaviside 投影 (xPhys)
+        # 公式: [tanh(beta*eta) + tanh(beta*(x_tilde - eta))] / [tanh(beta*eta) + tanh(beta*(1 - eta))]
+        num = np.tanh(beta * eta) + np.tanh(beta * (x_tilde - eta))
+        den = np.tanh(beta * eta) + np.tanh(beta * (1.0 - eta))
+        self.xPhys[:] = num / den
+        
+        # ==========================================
+        # 3. 目标与约束计算 (基于 xPhys)
+        # ==========================================
+        # 柔度目标 (基于投影后的物理密度)
+        obj = ((self.Emin + self.xPhys**self.penal * (self.Emax - self.Emin)) * ce).sum()
+        
+        # 实际体积分数 (基于物理密度和网格面积)
+        actual_volfrac = (self.xPhys.T @ self.volumes) / self.volumes_sum
+        
+        # MMA 的约束函数 fval (需为二维数组格式)
+        mu0 = 20.0  # Objective scale
+        mu1 = 1.0   # Constraint scale
+        f0val = mu0 * obj 
+        fval = mu1 * np.array([[actual_volfrac - self.volfrac]])
+        
+        # ==========================================
+        # 4. 链式求导法：d(Obj)/dx
+        # ==========================================
+        # A. 原始敏感度 (对 xPhys 求导)
+        dc_dxPhys = (-self.penal * self.xPhys**(self.penal-1) * (self.Emax - self.Emin)) * ce
+        dv_dxPhys = self.volumes / self.volumes_sum
+        
+        # B. Heaviside 的导数: d(xPhys) / d(x_tilde)
+        # 公式: beta * [1 - tanh^2(beta * (x_tilde - eta))] / den
+        dxPhys_dxtilde = beta * (1.0 - np.tanh(beta * (x_tilde - eta))**2) / den
+        
+        # C. 第一层链式求导：传回 x_tilde
+        dc_dxtilde = dc_dxPhys * dxPhys_dxtilde
+        dv_dxtilde = dv_dxPhys * dxPhys_dxtilde
+        
+        # D. 第二层链式求导：穿过高斯滤波器，传回给设计变量 x
+        self.dc[:] = (self.H @ dc_dxtilde) / self.Hs
+        dfdx_flat = (self.H @ dv_dxtilde) / self.Hs
+        
+        # 组装给 MMA 的梯度格式
+        df0dx = mu0 * self.dc[np.newaxis].T
+        dfdx = mu1 * dfdx_flat[np.newaxis]
+        
+        # ==========================================
+        # 5. 调用 MMA 求解器更新 x
+        # ==========================================
+        self.xval = self.x.copy()[np.newaxis].T 
+        xmma,ymma,zmma,lam,xsi,eta_mma,mu,zet,s,self.low,self.upp = mmasub(
+            self.m, self.nme, self.global_i, 
+            self.xval, self.xmin, self.xmax,
+            self.xold1, self.xold2, f0val,
+            df0dx, fval, dfdx,
+            self.low, self.upp,
+            self.a0, self.a, self.c, self.d, self.move)
+            
+        self.xold2 = self.xold1.copy()
+        self.xold1 = self.xval.copy()
+        self.x = xmma.copy().flatten()
+
+        print(f"Iter: {self.global_i:03d} | Beta: {beta:5.1f} | Vol: {actual_volfrac:.6f} | Obj: {obj:.6f}")
+
+        change = np.linalg.norm(self.x - self.xold1.flatten(), np.inf)
+
+        self.global_i += 1
+        if self.global_i == 100:
+            self.stop_flag = True
+
+        self.meta = {'x': self.x.copy().tolist(),
+                     'ce': ce.copy().tolist(),
+                     'obj': obj,
+                     'dc': self.dc.copy().tolist(),
+                     'change': change,
+                     'stop_flag': self.stop_flag}
+                     
+        return self.xPhys.copy()  # 注意：必须返回投影后的 xPhys 供主程序画图和计算外力！
+    
+class SIMP_ADMM(torch.nn.Module):
+    """
+    SIMP method for topology optimization with ADMM
+    """
+    def __init__(self, args) -> None:
+        super().__init__()
+
+        self.Emin = args["Emin"]
+        self.Emax = args["Emax"]
+        self.penal = args["penal"]
+        self.volfrac = args["args"]["volfrac"]
+        self.rmin = args["args"]["rmin"]
+        self.Th = args["Th"]
+        self.gamma_2 = args["args"]["gamma_2"]
+        self.ndof = args["ndof"]
+        self.nme = self.Th.me.shape[0]
+        self.x_init = self.volfrac * np.ones(self.Th.me.shape[0],dtype=float)
+        self.x_values = torch.logit(torch.tensor(self.volfrac * np.ones(self.Th.me.shape[0],dtype=float)))
+        self.W_x = torch.nn.Parameter(self.x_values)
+
+        self.volumes = torch.tensor(self.Th.areas)
+        self.volumes_sum = self.volumes.sum()
+        self.vol_goal = self.volumes_sum*self.volfrac
+
+        self.dv = self.Th.areas/self.Th.areas.max()
+        print("check dv", (self.dv == 0).sum(), self.dv.mean())
+        self.dc = np.ones(self.Th.me.shape[0])
+        self.ce = np.ones(self.Th.me.shape[0])
+        self.g = 0
+
+        self.H = filter_matrix(self.Th.centroids, self.rmin)
+        self.Hs = self.H.sum(1)
+
+        self.stop_flag = False
+        self.obj = 0
+
+        self.K_sep = torch.tensor( args["K_sep"])
+        self.indeces_K = torch.tensor(args["indeces_K"])
+        self.f = torch.tensor(args["f"])
+
+        self.global_i = 0
+        self.meta = {'x': self.x_values.detach().numpy().tolist(), 'stop_flag': self.stop_flag}
+
+        self.optimizer = torch.optim.Adam([self.W_x], lr=0.01)
+
+    def get_x(self, args):
+        u = torch.tensor(args["u"])
+
+        for i in range(10):
+            self.optimizer.zero_grad()
+
+            rho = torch.sigmoid(self.W_x)
+            # vofrac_loss = torch.nn.functional.relu(self.vol_goal - rho.T @ self.volumes)
+            vofrac_loss = torch.nn.functional.relu(rho.mean() - self.volfrac)
+
+            sK=(self.K_sep.T*(self.Emin+(rho)**self.penal*(self.Emax-self.Emin))).T.flatten()
+            # print(sK.shape)
+            # print(self.iK.shape)
+            # print(self.ndof)
+            # print(self.indeces_K.shape)
+            # print(sK.shape)
+            K = torch.sparse_coo_tensor(self.indeces_K, sK, size=(self.ndof, self.ndof))
+            confidence_loss = torch.norm(K @ u - self.f)
+
+            print(f'vol_loss: {vofrac_loss}, conf_loss: {confidence_loss}, rho: {rho.mean()}, {rho.min()}, {rho.max()}')
+
+            loss = vofrac_loss + self.gamma_2*confidence_loss
+            loss.backward()
+            self.optimizer.step()
+
+        self.global_i += 1
+
+        if self.global_i == 10:
+            self.stop_flag = True
+
+        return rho
+
+class GaussianSplattingCompliance(torch.nn.Module):
+    def __init__(self, dist_means_, coords, Emin, Emax, penal, num_samples, args):
+        super().__init__()
+
+        self.sigma_min = 0.002
+        self.sigma_max = 0.1
+        self.det_min = 3e-06
+        self.det_max = 5.5e-06
+        dist_means = torch.zeros((num_samples, 2))
+        init_num_samples = dist_means_.shape[0]
+
+        x_min = coords[:, 0].min()
+        x_max = coords[:, 0].max()
+        y_min = coords[:, 1].min()
+        y_max = coords[:, 1].max()
+
+        self.coord_max = torch.tensor([x_max, y_max])
+        self.coord_min = torch.tensor([x_min, y_min])
+
+        self.compliance_w = args["compliance_w"]
+        self.volfrac_w = args["volfrac_w"]
+        self.gaussian_overlap_w = args["gaussian_overlap_w"]
+        self.smooth_k = args["smooth_k"]
+
+        # print("dist_means: ", dist_means.shape)
+        # print("dist_means_: ", dist_means_.shape)
+        # print("init_num_samples: ", init_num_samples)
+
+        dist_means[:init_num_samples] = dist_means_
+
+
+        # scale_x = 1/coords[:, 0].max()
+        self.width_ratio = coords[:, 1].max()/coords[:, 0].max()
+        self.scaler = torch.tensor([1, self.width_ratio])
+        self.scale_sigma = torch.tensor(0.06)/4
+        self.scale_max = self.scale_sigma*2
+        self.scale_min = self.scale_sigma*0.75
+
+        self.rotation_min = -torch.pi/2
+        self.rotation_max = torch.pi/2
+
+        print("Scale_sigma_init: ", self.scale_sigma)
+
+        self.sigmas_ratio_max = 2.5
+        self.sigmas_ratio_min = 0.5
+
+        self.coords = coords
+
+        # coords[:, 0] = coords[:, 0]*scale_x
+        # coords[:, 1] = coords[:, 1]*scale_x
+
+        # center_coords_normalized = torch.tensor([0.5, 0.5*self.width_ratio]).type(torch.DoubleTensor) #.float()
+        # coords = (center_coords_normalized - coords) * 2.0
+
+        # dist_means[:, 0] = dist_means[:, 0]* scale_x
+        # dist_means[:, 1] = dist_means[:, 1]* scale_x
+
+        # dist_means = (center_coords_normalized - dist_means)*2.0
+
+        # self.coords = torch.tanh(torch.atanh(coords)).type(torch.DoubleTensor)
+
+        # offsets_values = torch.atan(dist_means.type(torch.DoubleTensor))
+        offsets_values = torch.logit((dist_means - self.coord_min)/(self.coord_max - self.coord_min)).type(torch.DoubleTensor)
+        # scale_values_real = torch.ones((num_samples, 1))*self.scale_sigma
+        scale_values = torch.logit((torch.ones((num_samples, 1))*self.scale_sigma - self.scale_min)/(self.scale_max - self.scale_min)).type(torch.DoubleTensor)
+        sigmas_ratio_values = torch.logit((torch.ones((num_samples, 1)) - self.sigmas_ratio_min)/(self.sigmas_ratio_max - self.sigmas_ratio_min)).type(torch.DoubleTensor)
+          # Initially set to 0, which corresponds to a ratio of 1 after applying tanh
+        rotation_values = torch.logit((torch.zeros((num_samples, 1)) - self.rotation_min)/(self.rotation_max - self.rotation_min)).type(torch.DoubleTensor)
+        
+        # self.W = torch.nn.Parameter(W_values)
+        # self.offset_values = torch.nn.Parameter(offsets_values)
+        # W_values = torch.cat([scale_values, rotation_values, offsets_values], dim=1)
+        
+        self.W_scale = torch.nn.Parameter(scale_values)
+        self.W_sigmas_ratio = torch.nn.Parameter(sigmas_ratio_values)
+        self.W_rotation = torch.nn.Parameter(rotation_values)
+        self.W_offsets = torch.nn.Parameter(offsets_values)
+
+        left_over_size = num_samples - init_num_samples
+        self.current_marker = init_num_samples
+
+        self.persistent_mask = torch.cat([torch.ones(init_num_samples, dtype=bool),torch.zeros(left_over_size, dtype=bool)], dim=0)
+        
+        # self.offsets_values = torch.nn.Parameter(torch.atan(dist_means.type(torch.DoubleTensor)))
+        # self.scale_values = torch.nn.Parameter(torch.logit(torch.ones((num_samples, 2))*self.scale_sigma).type(torch.DoubleTensor))
+        # self.rotation_values = torch.nn.Parameter(torch.atanh(torch.zeros((num_samples, 1))).type(torch.DoubleTensor))
+
+        self.Emin = Emin
+        self.Emax = Emax
+        self.penal = penal
+
+        self.points_inside_elements = {}
+
+    def get_x(self, save_kernel_sums=False):
+
+        # TODO: rewrite becasu sclaing is used twice
+
+        W_scale = self.W_scale[self.persistent_mask]
+        W_sigmas_ratio = self.W_sigmas_ratio[self.persistent_mask] 
+        W_rotation = self.W_rotation[self.persistent_mask]
+        W_offsets = self.W_offsets[self.persistent_mask]
+        batch_size = W_scale.shape[0]
+
+        base_scale = (self.scale_max - self.scale_min)*torch.sigmoid(W_scale) + self.scale_min
+        base_scale = base_scale.squeeze()
+        sigmas_ratio = (self.sigmas_ratio_max - self.sigmas_ratio_min)*torch.sigmoid(W_sigmas_ratio) + self.sigmas_ratio_min    
+        scale = torch.cat([torch.ones(batch_size, 1), torch.ones(batch_size, 1) * sigmas_ratio], dim=1)
+        # scale = torch.cat([base_scale, base_scale * sigmas_ratio], dim=1)
+        # rotation = np.pi/2 * torch.tanh(W_rotation).view(batch_size)
+        rotation = self.rotation_min + (self.rotation_max - self.rotation_min)*torch.sigmoid(W_rotation).view(batch_size)
+        # offsets = torch.tanh(W_offsets)*self.scaler
+        offsets = self.coord_min + (self.coord_max - self.coord_min)*torch.sigmoid(W_offsets)
+
+        if save_kernel_sums:
+            # Calculate pairwise Euclidean distances between offsets
+            n = offsets.shape[0]
+            offsets_flat = offsets.squeeze()  # Remove extra dimensions to get (n,2) shape
+            distances = torch.cdist(offsets_flat, offsets_flat, p=2)  # Compute pairwise L2 distances
+
+        cos_rot = torch.cos(rotation)
+        sin_rot = torch.sin(rotation)
+
+        # rotation matrix
+        R = torch.stack([
+            torch.stack([cos_rot, -sin_rot], dim=-1),
+            torch.stack([sin_rot, cos_rot], dim=-1)
+        ], dim=-2)
+
+        # S = torch.diag_embed(scale)
+
+        # Compute covariance matrix: RSS^TR^T
+        # pre_covariance = R @ S @ S @ R.transpose(-1, -2)
+        # pre_covariance = S * S
+        # print("det_coeffi: ", torch.sqrt(0.00005/torch.det(pre_covariance).sum()))
+        # covariance = torch.sqrt(0.00005/torch.det(pre_covariance).sum())*pre_covariance
+        # covariance = pre_covariance + torch.eye(2).unsqueeze(0).expand(batch_size, -1, -1) * 1e-6
+        # print("covariance: ", covariance.shape)
+        # print("base_scale: ", base_scale.shape)
+
+        # covariance = covariance #* base_scale 
+        # covariance_diag = torch.diagonal(covariance, dim1=-2, dim2=-1)
+        covariance_diag = scale**2
+        pre_inv_covariance_diag = 1/(covariance_diag + 1e-6)
+
+        pre_inv_covariance = torch.diag_embed(pre_inv_covariance_diag)
+        # pre_inv_covariance = pre_inv_covariance
+
+        # Compute inverse covariance
+        coords = self.coords.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        offsets = offsets[:, None, None, :]
+        xy = coords - offsets
+
+        xy = xy /((base_scale[:, None, None, None])+1e-8)
+
+        # Apply rotation to coordinates
+        rotated_xy = torch.einsum('bij,bxyj->bxyi', R, xy)
+        
+        # Calculate z using pre_inv_covariance (no rotation)
+        z = torch.einsum('bxyi,bij,bxyj->bxy', rotated_xy, -0.5 * pre_inv_covariance, rotated_xy)
+        # z = z + torch.log(torch.tensor(100))
+        # kernel = torch.exp(z) / (2 * torch.tensor(np.pi) * torch.sqrt(torch.det(covariance)+1e-8)).view(batch_size, 1, 1)
+        # Add eps to determinant calculations
+        # det_covariance = torch.det(covariance) + 1e-8
+        # det_covariance = torch.prod(covariance_diag, dim=1)
+        # det_covariance = det_covariance * base_scale**4
+        # Safeguard the sqrt operation
+        # print("det_covariance: ", det_covariance.shape)
+        # sqrt_det = torch.sqrt(torch.clamp(det_covariance, min=1e-8))
+        # print("sqrt_det: ", sqrt_det.shape)
+        # print("sqrt_det: ", sqrt_det)
+        # print("area: ", 2 * torch.tensor(np.pi) * sqrt_det)
+        # Modify kernel calculation to prevent division by zero
+        # kernel = torch.exp(z) / (2 * torch.tensor(np.pi) * sqrt_det).view(batch_size, 1, 1)
+        kernel = torch.exp(z)
+        kernel = torch.squeeze(kernel)
+
+        # print("kernel: ", kernel.min(), kernel.max(), kernel.shape)
+
+        # TODO: find a more suitable threshold for merging (large overlap, volfrac convergence criteria, max_scale or max det)
+        if save_kernel_sums:
+            # kernel_sigmoids = torch.sigmoid(kernel) 
+            # Compute pairwise sums of kernel vectors
+            n = kernel.shape[0]  # number of vectors
+            pairwise_sums = torch.zeros((n, n), device=kernel.device)
+
+            close_gauss_pairs = []
+            close_pair_kernel_sums = []
+            self.points_inside_elements = {}
+
+            for i in range(n):
+                for j in range(n):
+                    if j > i:
+                        sum_ij = kernel[i] + kernel[j]
+                        pairwise_sums[i,j] = sum_ij.max()
+                        # print("sum_{}_{}: ".format(i, j), sum_ij.max())
+                        if sum_ij.max() > 1.0:
+                            close_gauss_pairs.append((i, j))
+                            close_pair_kernel_sums.append(sum_ij.max())
+
+                            if i not in self.points_inside_elements.keys():
+                                self.points_inside_elements[i] = self.coords[kernel[i] > 0.5]
+
+                            if j not in self.points_inside_elements.keys():
+                                self.points_inside_elements[j] = self.coords[kernel[j] > 0.5]
+            # print("Pairwise max sums shape:", pairwise_sums.shape)
+            print(pairwise_sums)
+
+            # Convert pairs and sums to tensors and sort by sum values
+            if close_gauss_pairs:  # Only process if there are pairs
+                pairs_tensor = torch.tensor(close_gauss_pairs, device=pairwise_sums.device)
+                sums_tensor = torch.tensor(close_pair_kernel_sums, device=pairwise_sums.device)
+                
+                # Sort by kernel sums in descending order
+                sorted_indices = torch.argsort(sums_tensor, descending=True)
+                pairs_tensor = pairs_tensor[sorted_indices]
+                sums_tensor = sums_tensor[sorted_indices]
+                
+                close_gauss_pairs = pairs_tensor.tolist()
+                close_pair_kernel_sums = sums_tensor.tolist()
+
+            self.merging_pairs = close_gauss_pairs
+            self.merging_kernel_sums = close_pair_kernel_sums
+             
+        kernel_sum = kernel.sum(dim=0)+1e-8
+
+        # print("kernel_sum: ", kernel_sum.min(), kernel_sum.max(), kernel_sum.shape)
+        # kernel_sum_features = torch.log(kernel_sum)
+        # print("kernel_sum_features: ", kernel_sum_features.min(), kernel_sum_features.max(), kernel_sum_features.shape)
+
+        # self.H = (1 - self.Emin)*torch.sigmoid(-4*kernel_sum_features) + self.Emin
+        self.H = (1 - self.Emin)*torch.sigmoid(-self.smooth_k*(kernel_sum - 0.4)) + self.Emin
+        self.H_splitted = (1 - self.Emin)*torch.sigmoid(1.8*self.smooth_k*(kernel - 0.1)) + self.Emin
+        # self.H_splitted = (1 - self.Emin)*torch.sigmoid(4*torch.log(kernel*1.1)) + self.Emin
+        self.H_splitted_sum = self.H_splitted.sum(dim=0)
+        # print("H_splitted: ", self.H_splitted.min(), self.H_splitted.max(), self.H_splitted.shape)
+        # print("H_splitted_sum: ", self.H_splitted_sum.min(), self.H_splitted_sum.max(), self.H_splitted_sum.shape)
+        self.H_offset = (1 - self.Emin)*torch.sigmoid(-4*torch.log(kernel_sum*1.1)) + self.Emin
+
+        return self.H
+
+    def prepare_grads(self):
+        print("persistent_mask: ", self.persistent_mask)
+        self.W_scale.grad.data[~self.persistent_mask] = 0.0
+        self.W_sigmas_ratio.grad.data[~self.persistent_mask] = 0.0
+        self.W_rotation.grad.data[~self.persistent_mask] = 0.0
+        self.W_offsets.grad.data[~self.persistent_mask] = 0.0
+        # self.W.grad.data[self.persistent_mask, 3:] *= 0.1
+
+        # W_scale = self.W_scale
+        # W_sigmas_ratio = self.W_sigmas_ratio 
+
+        # base_scale = (self.scale_max - self.scale_min)*torch.sigmoid(W_scale) + self.scale_min
+        # sigmas_ratio = (self.sigmas_ratio_max - self.sigmas_ratio_min)*torch.sigmoid(W_sigmas_ratio) + self.sigmas_ratio_min
+        # scale = torch.cat([base_scale, base_scale * sigmas_ratio], dim=1)
+
+        # # don't update sigmasgradients for small determinants
+        # # scale = (self.sigma_max - self.sigma_min)*torch.sigmoid(self.W_scale_rotation[:, 0:2]) + self.sigma_min
+        # S = torch.diag_embed(scale)
+        # covariance = S @ S.transpose(-1, -2)
+        # det_covariance = torch.det(covariance)
+
+        # print("#####   prepare_grads   #####")
+        # print("det_covariance: ", det_covariance[self.persistent_mask])
+        # valid_det_mask = det_covariance < self.det_min
+        # scale1_gradient_mask = torch.logical_and(valid_det_mask, (self.W_scale.grad.data[:, 0] > 0))    
+        # # scale2_gradient_mask = torch.logical_and(valid_det_mask, (self.W_scale_rotation.grad.data[:, 1] > 0))
+
+        # print("scale1_grad: ", self.W_scale.grad.data[self.persistent_mask, 0])
+        # print("scale2_grad: ", self.W_sigmas_ratio.grad.data[self.persistent_mask, 0])
+        # print("scale1_gradient_mask: ", scale1_gradient_mask[self.persistent_mask])
+        # # print("scale2_gradient_mask: ", scale2_gradient_mask[self.persistent_mask])
+
+        # self.W_scale.grad.data[scale1_gradient_mask, 0] = 0.0
+        # # self.W_scale_rotation.grad.data[scale2_gradient_mask, 1] = 0.0
+
+        # print("Determinant sum: ", det_covariance[self.persistent_mask].sum())
+
+    def forward(self, ce):
+
+        # compliance_w = 2*(10**4)
+        # volfrac_w = 1 
+        # gaussian_overlap_w = 2
+
+        # Add numerical stability to compliance calculation
+        H_vec = torch.clamp(self.H, min=self.Emin, max=self.Emax)**self.penal
+        compliance = torch.dot(H_vec, ce)
+        
+        # Safeguard the loss calculations
+        volfrac_loss_pre = torch.nn.functional.relu(
+            self.H.mean() - 0.6
+        )
+        
+        gaussian_overlap = torch.nn.functional.relu(
+            self.H_splitted_sum - 1.5
+        ).mean()
+
+        print("volume: ", self.H.mean())
+        print("compliance: ", compliance)
+        print("gaussian_overlap: ", gaussian_overlap)
+        # print("comb_loss: ", 0.00001*self.combine_loss.sum())
+
+        # if volfrac_loss > 0.6:
+        # obj_ce -= 0.00000001*volfrac_loss
+        # obj_ce = 0.0000001*self.combine_loss.sum()
+
+        # obj_ce = compliance/(volfrac_loss)
+        # obj_ce = (volfrac_loss-1)/(2*(1-compliance))
+        # obj_ce = compliance
+
+
+        obj_ce = -compliance*self.compliance_w + volfrac_loss_pre*self.volfrac_w + gaussian_overlap*self.gaussian_overlap_w
+        obj_real = compliance*self.compliance_w + volfrac_loss_pre*self.volfrac_w + gaussian_overlap*self.gaussian_overlap_w
+
+        return obj_ce, volfrac_loss_pre, gaussian_overlap, compliance, obj_real
+    
+    def splitting_1(self):
+        # find ids for splitting
+        W_scale_rotation = self.W_scale_rotation[self.persistent_mask]
+        W_offsets = self.W_offsets[self.persistent_mask]
+        batch_size = W_scale_rotation.shape[0]
+
+        scale = (self.sigma_max - self.sigma_min)*torch.sigmoid(W_scale_rotation[:, 0:2]) + self.sigma_min
+        rotation = np.pi/2 * torch.tanh(W_scale_rotation[:, 2]).view(batch_size)
+        offsets = torch.tanh(W_offsets)*self.scaler
+
+        sigmas_maxs = torch.amax(scale, dim=1)
+        sigmas_mins = torch.amin(scale, dim=1)
+        sigmas_ratio = sigmas_maxs/sigmas_mins
+
+        splitting_indices = torch.argsort(sigmas_ratio)[-2:]
+
+        start_index = self.current_marker + 1
+        end_index = self.current_marker + 1 + len(splitting_indices)
+        self.persistent_mask[start_index: end_index] = True
+        self.W_scale_rotation.data[start_index:end_index, :] = self.W_scale_rotation.data[splitting_indices, :]
+        self.W_offsets.data[start_index:end_index, :] = self.W_offsets.data[splitting_indices, :]
+        # scale_reduction_factor = 2**(1/8)
+        scale_reduction_factor = 1/(2**0.25)
+        scale_new = (self.sigma_max - self.sigma_min)*torch.sigmoid(self.W_scale_rotation.data[start_index:end_index, 0:2]) + self.sigma_min
+        scale_new *= scale_reduction_factor
+        scale_new = (scale_new - self.sigma_min)/(self.sigma_max - self.sigma_min)
+
+        self.W_scale_rotation.data[start_index:end_index, 0:2] = torch.logit(scale_new)
+        self.W_scale_rotation.data[splitting_indices, 0:2] = torch.logit(scale_new)
+        self.current_marker = self.current_marker + len(splitting_indices)
+
+    def cleaning(self):
+        # scale = (self.sigma_max - self.sigma_min)*torch.sigmoid(self.W.data[:, 0:2]) + self.sigma_min
+
+
+        # print("Scale stat for cleaning: ")
+        # print(scale.min(), scale.mean(), scale.max())
+
+        W_scale_rotation = self.W_scale_rotation[self.persistent_mask]
+        W_offsets = self.W_offsets[self.persistent_mask]
+        batch_size = W_scale_rotation.shape[0]
+
+        scale = (self.sigma_max - self.sigma_min)*torch.sigmoid(W_scale_rotation[:, 0:2]) + self.sigma_min
+        rotation = np.pi/2 * torch.tanh(W_scale_rotation[:, 2]).view(batch_size)
+        offsets = torch.tanh(W_offsets)*self.scaler
+
+        # print("Sigmas: ", scale)
+        # offsets = torch.tanh(self.offsets_values)*self.scaler
+        # offsets[:, 1] = self.width_ratio*offsets[:, 1]
+        # offsets = self.offsets_values
+        # batch_size = offsets.shape[0]
+        # rotation = np.pi/2 * torch.tanh(self.rotation_values).view(batch_size)
+
+        # Compute the components of the covariance matrix
+        cos_rot = torch.cos(rotation)
+        sin_rot = torch.sin(rotation)
+
+        R = torch.stack([
+            torch.stack([cos_rot, -sin_rot], dim=-1),
+            torch.stack([sin_rot, cos_rot], dim=-1)
+        ], dim=-2)
+
+        S = torch.diag_embed(scale)
+
+        # Compute covariance matrix: RSS^TR^T
+        pre_covariance = R @ S @ S @ R.transpose(-1, -2)
+        det_coeff = torch.sqrt(0.00005/torch.det(pre_covariance).sum())
+        
+        corrected_scale = torch.sqrt(det_coeff)*scale
+        corrected_scale_min = torch.amin(corrected_scale, dim=1)
+
+        good_scale_mask = corrected_scale_min > 0.018
+        persistent_mask_indices = torch.arange(self.persistent_mask.shape[0])[self.persistent_mask]
+        self.persistent_mask[persistent_mask_indices] = good_scale_mask 
+
+
+        # print("Scale stat for cleaning: ")
+        # print(corrected_scale.min(), corrected_scale.mean(), corrected_scale.max())
+                
+    def splitting_2(self):
+        # find ids for splitting
+        # output = self.W[self.persistent_mask]
+        # batch_size = output.shape[0]
+
+        # scale = (self.sigma_max - self.sigma_min)*torch.sigmoid(output[:, 0:2]) + self.sigma_min
+        # # print("sigmas_1", scale)
+        # rotation = np.pi/2 * torch.tanh(output[:, 2]).view(batch_size)
+        # offsets = torch.tanh(output[:, 3:])*self.scaler
+
+        # sigmas_maxs = torch.amax(scale, dim=1)
+        # sigmas_mins = torch.amin(scale, dim=1)
+        # sigmas_ratio = sigmas_maxs/sigmas_mins
+
+        # splitting_indices = torch.argsort(sigmas_ratio)[-2:]
+
+        grad_threshold = 3e-6
+        gauss_threshold = 0.072
+        sigmas_r_threshold = 1.1
+        sigma_min_threshold = 0.0035
+        top_k_split = 2
+
+        # gradient_norms = torch.norm(self.W.grad[self.persistent_mask][:, 3:], dim=1, p=2)
+        # gaussian_norms = torch.norm(torch.sigmoid(self.W.data[self.persistent_mask][:, 0:2]), dim=1, p=2)
+
+
+
+        scale = (self.sigma_max - self.sigma_min)*torch.sigmoid(self.W_scale_rotation[:, 0:2]) + self.sigma_min
+        S = torch.diag_embed(scale)
+        covariance = S @ S.transpose(-1, -2)
+
+        sigmas_maxs = torch.amax(scale, dim=1)
+        sigmas_mins = torch.amin(scale, dim=1)
+        sigmas_ratio = sigmas_maxs/sigmas_mins
+        covariance_det = torch.det(covariance)
+
+        print("Sigmas_ratio: ", sigmas_ratio)
+        print("covariance det: ", covariance_det)
+        print("covariance_det_sum: ", torch.sum(covariance_det))
+
+        # Sort indices by determinant in descending order
+        sorted_det, sorted_det_indices = torch.sort(covariance_det, descending=True)
+
+        # Take top k indices with largest determinants
+        splitting_indices = sorted_det_indices[sorted_det > self.det_max][:top_k_split]
+
+        # Ensure we have unique indices
+        splitting_indices = torch.unique(splitting_indices)
+        # splitting_indices = torch.empty(0, dtype=torch.long)
+        
+        # print("large_sigmas_r_indices: ", large_sigmas_r_indices)
+        print("Split ids: ", splitting_indices)
+        print("covariance det after: ", covariance_det[splitting_indices])
+        # common_indices = large_gradient_indices[common_indices_mask]
+
+        # splitting_indices = large_gradient_indices[common_indices_mask]
+
+        #########################
+        
+        # scale_reduction_factor = 2**(1/8)
+        scale_reduction_factor = 1/(2**0.25)
+        scale_pre_init = (self.sigma_max - self.sigma_min)*torch.sigmoid(self.W_scale_rotation.data[splitting_indices, 0:2]) + self.sigma_min
+        # main_axis_longer = (scale_pre[:, 0] / scale_pre[:, 1]) >= 1
+        scale_pre_init *= scale_reduction_factor
+        scale_new_pre = torch.sqrt(scale_pre_init[:, 0]*scale_pre_init[:, 1])
+        scale_new = scale_pre_init
+        scale_new[:, 0] = scale_new_pre
+        scale_new[:, 1] = scale_new_pre
+        
+        scale_new = torch.logit((scale_new - self.sigma_min)/(self.sigma_max - self.sigma_min))
+        
+        start_index = self.current_marker + 1
+        end_index = self.current_marker + 1 + len(splitting_indices)
+        self.persistent_mask[start_index: end_index] = True
+        self.W_scale_rotation.data[start_index:end_index, :] = self.W_scale_rotation.data[splitting_indices, :]
+        self.W_offsets.data[start_index:end_index, :] = self.W_offsets.data[splitting_indices, :]
+
+        self.W_scale_rotation.data[start_index:end_index, 0:2] = scale_new
+        self.W_scale_rotation.data[splitting_indices, 0:2] = scale_new
+
+        rotation = np.pi/2 * torch.tanh(self.W_scale_rotation.data[start_index:end_index, 2])
+        offsets = torch.tanh(self.W_offsets.data[start_index:end_index])*self.scaler
+
+        # rotation_new = rotation
+        # sigmas = (self.sigma_max - self.sigma_min)*torch.sigmoid(self.W.data[start_index:end_index, 0:2]) + self.sigma_min
+        main_axis_longer = (scale_pre_init[:, 0] / scale_pre_init[:, 1]) >= 1
+        moving_vectors = torch.zeros_like(scale_pre_init)
+
+        main_axis_vec = torch.vstack([torch.cos(rotation), torch.sin(rotation)]).T
+        minor_axis_vec = torch.vstack([torch.sin(rotation), -torch.cos(rotation)]).T
+
+        moving_vectors[main_axis_longer] = main_axis_vec[main_axis_longer]
+        moving_vectors[~main_axis_longer] = minor_axis_vec[~main_axis_longer]
+
+        scale_new_pre = scale_new_pre[:, None]
+
+        offsets_new_forw = offsets + moving_vectors*scale_new_pre*1
+        offsets_new_back = offsets - moving_vectors*scale_new_pre*1
+
+        # offsets_new = offsets
+
+        # rotation_w = torch.atan(rotation_new*2/np.pi)
+        offsets_forw_w = torch.atan(offsets_new_forw/self.scaler)
+        offsets_back_w = torch.atan(offsets_new_back/self.scaler)
+
+        # self.W_scale_rotation.data[start_index:end_index, 2] = 0
+        # self.W_scale_rotation.data[splitting_indices, 2] = 0
+
+        # self.W_offsets.data[start_index:end_index] = offsets_forw_w
+        # self.W_offsets.data[splitting_indices] = offsets_back_w
+
+        self.current_marker = self.current_marker + len(splitting_indices)
+
+    def merging(self):
+        # TODO: rotation is inncorrectly used (need to take into account sin). 
+        # also check the result areas
+        # check determinant before splitting
+        W_scale = self.W_scale[self.persistent_mask]
+        W_sigmas_ratio = self.W_sigmas_ratio[self.persistent_mask]
+        batch_size = W_scale.shape[0]
+
+        base_scale = (self.scale_max - self.scale_min)*torch.sigmoid(W_scale) + self.scale_min
+        sigmas_ratio = (self.sigmas_ratio_max - self.sigmas_ratio_min)*torch.sigmoid(W_sigmas_ratio) + self.sigmas_ratio_min
+        # print("sigmas_ratio: ", sigmas_ratio.shape)
+        # print("base_scale: ", base_scale.shape)
+        scale = torch.cat([base_scale, base_scale * sigmas_ratio], dim=1)
+        
+        covariance_diag = scale.pow(2)
+        det_covariance = torch.prod(covariance_diag, dim=1)
+        # print("det_covariance: ", det_covariance)
+        # print("det_covariance_sum: ", det_covariance.sum())
+
+        ###############################################################################################################
+        persistent_mask_indices = torch.arange(self.persistent_mask.shape[0])[self.persistent_mask]
+
+        areas = np.pi * np.sqrt(det_covariance.detach().cpu().numpy())
+
+        # print("merging pairs: ", self.merging_pairs)
+
+        while len(self.merging_pairs) > 0:
+            process_pair = self.merging_pairs.pop(0)
+            print(process_pair)
+            # new_offset = (offsets[process_pair[0]] + offsets[process_pair[1]])/
+
+            current_index = self.current_marker + 1
+
+            # print("points_inside_elements: ", self.points_inside_elements.keys())
+
+            x = torch.cat([self.points_inside_elements[process_pair[0]], self.points_inside_elements[process_pair[1]]])
+            x = x.unique(dim=0)
+            x_mean = x.mean(dim=0).clone()
+            x = x - x_mean
+            x = x.detach().cpu().numpy()
+
+            # print("x.shape: ", x.shape)
+            # print("x: ", x.min(), x.max())
+
+            target_area = areas[process_pair[0]] + areas[process_pair[1]]
+
+            center, R, Sigma = fit_ellipsoid(x, target_area)
+            center = x_mean - torch.tensor(center)
+            R = torch.tensor(R)
+            # center = torch.tensor(x).mean(dim=0)
+
+            # print("R: ", R)
+
+            # alpha = torch.abs(torch.tensor(np.arctan2(R[1, 0], R[0, 0])))
+            alpha = torch.arccos(R[0, 0])
+            # alpha = torch.tensor(np.arctan2(R[1, 0], R[0, 0]))
+            if alpha > torch.pi/2:
+                alpha = alpha - torch.pi
+            elif alpha < -torch.pi/2:
+                alpha = alpha + torch.pi
+
+            # print("alpha: ", alpha)
+            # print("atan_alpha: ", torch.atan(alpha*2/np.pi))
+            scale = torch.tensor(Sigma[0])
+            ratio = torch.tensor(Sigma[1]/Sigma[0])
+
+            # result_area = np.pi * np.sqrt(np.linalg.det(np.diag(Sigma) @ np.diag(Sigma).T))
+            scale = min(
+                self.scale_max - 0.1 * (self.scale_max - self.scale_min),
+                max(self.scale_min + 0.1 * (self.scale_max - self.scale_min), scale)
+            )
+            ratio = min(
+                self.sigmas_ratio_max - 0.1 * (self.sigmas_ratio_max - self.sigmas_ratio_min),
+                max(self.sigmas_ratio_min + 0.1 * (self.sigmas_ratio_max - self.sigmas_ratio_min), ratio)
+            )
+
+            scale = torch.tensor(scale)
+            ratio = torch.tensor(ratio)
+
+            # print("target_area:", target_area)
+            # print("result_area: ", result_area)
+            # print("scale_range: ", self.scale_max, self.scale_min)
+            # print("scale: ", scale)
+            # print("logit_scale: ", torch.logit((scale - self.scale_min)/(self.scale_max - self.scale_min)))
+            # print("ratio_range: ", self.sigmas_ratio_max, self.sigmas_ratio_min)
+            # print("ratio: ", ratio)
+            # print("logit_ratio: ", torch.logit((ratio - self.sigmas_ratio_min)/(self.sigmas_ratio_max - self.sigmas_ratio_min)))
+
+            # print("center_range: ", self.coord_min, self.coord_max)
+            # print("center: ", center)
+            # print("logit_center: ", torch.logit((center - self.coord_min)/(self.coord_max - self.coord_min)))
+
+            self.W_rotation.data[current_index] = torch.logit((alpha - self.rotation_min)/(self.rotation_max - self.rotation_min))
+            self.W_scale.data[current_index] = torch.logit((scale - self.scale_min)/(self.scale_max - self.scale_min))
+            self.W_sigmas_ratio.data[current_index] = torch.logit((ratio - self.sigmas_ratio_min)/(self.sigmas_ratio_max - self.sigmas_ratio_min))
+            self.W_offsets.data[current_index] = torch.logit((center - self.coord_min)/(self.coord_max - self.coord_min))
+
+            self.persistent_mask[current_index] = True
+            self.persistent_mask[persistent_mask_indices[process_pair[0]]] = False
+            self.persistent_mask[persistent_mask_indices[process_pair[1]]] = False
+
+            # Remove any remaining pairs that contain the merged indices
+            self.merging_pairs = [pair for pair in self.merging_pairs if process_pair[0] not in pair and process_pair[1] not in pair]
+
+            self.current_marker += 1
+        ##########################################################################################################
+        # check determinant before splitting
+        W_scale = self.W_scale[self.persistent_mask]
+        W_sigmas_ratio = self.W_sigmas_ratio[self.persistent_mask]
+        batch_size = W_scale.shape[0]
+
+        base_scale = (self.scale_max - self.scale_min)*torch.sigmoid(W_scale) + self.scale_min
+        sigmas_ratio = (self.sigmas_ratio_max - self.sigmas_ratio_min)*torch.sigmoid(W_sigmas_ratio) + self.sigmas_ratio_min    
+        scale = torch.cat([base_scale, base_scale * sigmas_ratio], dim=1)
+        
+        covariance_diag = scale.pow(2)
+        det_covariance = torch.prod(covariance_diag, dim=1)
+        # print("det_covariance: ", det_covariance)
+        # print("det_covariance_sum: ", det_covariance.sum())
+
+        ###############################################################################################################
+    
+    def densification(self):
+
+        # check determinant before splitting
+        output = self.W_scale_rotation[self.persistent_mask]
+        batch_size = output.shape[0]
+        scale = (self.sigma_max - self.sigma_min)*torch.sigmoid(output[:, 0:2]) + self.sigma_min
+        rotation = np.pi/2 * torch.tanh(output[:, 2]).view(batch_size)
+        cos_rot = torch.cos(rotation)
+        sin_rot = torch.sin(rotation)
+        R = torch.stack([
+            torch.stack([cos_rot, -sin_rot], dim=-1),
+            torch.stack([sin_rot, cos_rot], dim=-1)
+        ], dim=-2)
+        S = torch.diag_embed(scale)
+        # Compute covariance matrix: RSS^TR^T
+        pre_covariance = R @ S @ S @ R.transpose(-1, -2)
+        covariance = torch.sqrt(0.00005/torch.det(pre_covariance).sum())*pre_covariance
+        # print("precov_DET: ", torch.det(pre_covariance))
+        # print("precov_DET_half: ", torch.det(pre_covariance)/2)
+        # print("DETERMINanat list before: ", torch.det(covariance))
+
+        ###############################################################################################################
+
+        # Calculate the norm of gradients
+        # scale = (self.sigma_max - self.sigma_min)*torch.sigmoid(output[:, 0:2]) + self.sigma_min
+        # sigmas_maxs = torch.amax(scale, dim=1)
+        # sigmas_mins = torch.amin(scale, dim=1)
+        # sigmas_ratio = sigmas_maxs/sigmas_mins
+        # gradient_norms = torch.norm(self.W.grad[self.persistent_mask][:, 3:], dim=1, p=2)
+        # gaussian_norms = torch.norm(torch.sigmoid(self.W.data[self.persistent_mask][:, 0:2]), dim=1, p=2)
+
+        # print("######################### stats for criteria ###################################")
+        # print("gradient")
+        # print(gradient_norms.min(), gradient_norms.mean(), gradient_norms.max())
+        # print("gauss")
+        # print(gaussian_norms.min(), gaussian_norms.mean(), gaussian_norms.max())
+        # print("scale ratio")
+        # print(sigmas_ratio.min(), sigmas_ratio.mean(), sigmas_ratio.max())
+
+        # print("################################################################################")
+
+        # find ids for splitting
+        self.splitting_2()
+
+        ##########################################################################################################
+        # check determinant before splitting
+        output = self.W_scale_rotation[self.persistent_mask]
+        batch_size = output.shape[0]
+        scale = (self.sigma_max - self.sigma_min)*torch.sigmoid(output[:, 0:2]) + self.sigma_min
+        rotation = np.pi/2 * torch.tanh(output[:, 2]).view(batch_size)
+        cos_rot = torch.cos(rotation)
+        sin_rot = torch.sin(rotation)
+        R = torch.stack([
+            torch.stack([cos_rot, -sin_rot], dim=-1),
+            torch.stack([sin_rot, cos_rot], dim=-1)
+        ], dim=-2)
+        S = torch.diag_embed(scale)
+        # Compute covariance matrix: RSS^TR^T
+        pre_covariance = R @ S @ S @ R.transpose(-1, -2)
+        covariance = torch.sqrt(0.00005/torch.det(pre_covariance).sum())*pre_covariance
+        print("precov_DET: ", torch.det(pre_covariance))
+        print("DETERMINanat list after: ", torch.det(covariance))
+
+        ###############################################################################################################
+
+    def get_final_x(self):
+
+        W_scale = self.W_scale[self.persistent_mask]
+        W_sigmas_ratio = self.W_sigmas_ratio[self.persistent_mask] 
+        W_rotation = self.W_rotation[self.persistent_mask]
+        W_offsets = self.W_offsets[self.persistent_mask]
+        batch_size = W_scale.shape[0]
+
+        base_scale = (self.scale_max - self.scale_min)*torch.sigmoid(W_scale) + self.scale_min
+        base_scale = base_scale.squeeze()
+        sigmas_ratio = (self.sigmas_ratio_max - self.sigmas_ratio_min)*torch.sigmoid(W_sigmas_ratio) + self.sigmas_ratio_min    
+        scale = torch.cat([torch.ones(batch_size, 1), torch.ones(batch_size, 1) * sigmas_ratio], dim=1)
+        rotation = self.rotation_min + (self.rotation_max - self.rotation_min)*torch.sigmoid(W_rotation).view(batch_size)
+        offsets = self.coord_min + (self.coord_max - self.coord_min)*torch.sigmoid(W_offsets)
+
+        design_vars = {"scale": base_scale.detach().cpu().numpy().tolist(),
+                       "sigmas_ratio": sigmas_ratio.detach().cpu().numpy().tolist(),
+                       "rotation": rotation.detach().cpu().numpy().tolist(),
+                       "offsets": offsets.detach().cpu().numpy().tolist()}
+
+        return design_vars
+    
+# =====================================================================
+# 追加在文件最底部的独立执行脚本 (TreeTOp 结果交叉验证)
+# =====================================================================
+if __name__ == '__main__':
+    import os
+    
+    print("---------------------------------------------------")
+    print("启动 TreeTOp 结果交叉验证脚本...")
+    
+    # 1. 检查 TreeTOp 的结果文件是否存在
+    npy_path = '/home/ubuntu/projects/TreeTOp-main/TreeTOp-main/results/final_density.csv'
+    if not os.path.exists(npy_path):
+        print(f"❌ 找不到文件: {npy_path}")
+        print("请确保你已经在 TreeTOp 中跑出了 .npy 格式的最终密度文件。")
+        exit()
+
+    # 2. 伪造最小化依赖的 args 字典
+    # 【注意】：请把 'problem_name' 换成你当时测试用的实际名字 (比如 'mbb_beam')
+    # 这样它才能去 problems.json 里读出正确的网格文件
+    args = {
+        'problem_name': 'Cantilever_beam_distributed_load',  # <--- 修改为你的真实 problem_name
+        'penal': 3.0,                # 强制 penal=1，对齐 TreeTOp 的线性插值
+        'method': 'dummy',           # 占位符
+        'image_size': 12
+    }
+
+    # 3. 构造一个空的方法类，防止 activate_method 报错
+    class DummyMethod:
+        def __init__(self, meth_args):
+            self.global_i = 0
+            self.meta = {}
+            self.stop_flag = True
+
+    method_dict = {'dummy': DummyMethod}
+
+    # 4. 实例化你原本的优化器环境 (读取网格、组装刚度矩阵)
+    print("正在初始化原有的有限元环境...")
+    # activate_method=False 告诉它别跑优化，只搭环境
+    optimizer = TopOptimizer2D(method_dict, args, activate_method=False)
+    
+    # 再次强制覆盖惩罚因子
+    optimizer.penal = 3.0
+
+# =================================================================
+    # 5. 直接读取绝对纯净的 CSV 数据，并修复 60x60 坐标系翻转问题
+    # =================================================================
+    print("正在读取 TreeTOp 纯净版 CSV 密度数据...")
+    
+    csv_path = '/home/ubuntu/projects/TreeTOp-main/TreeTOp-main/results/final_density.csv'
+    clean_data = np.loadtxt(csv_path, delimiter=',')
+    
+    # 🌟 【核心修复】：强行转置矩阵！🌟
+    # 因为 TreeTOp 导出的矩阵行是 X，列是 Y
+    # 我们必须把它转置成 行是 Y，列是 X，才能完美喂给你的旧代码！
+    clean_data = clean_data.T 
+        
+    # 把纯净矩阵保存为一个临时的 .npy 文件
+    clean_path = './temp_clean_density.npy'
+    np.save(clean_path, clean_data)
+
+    print("正在映射清洗后的密度矩阵，k=4 近邻平滑...")
+    # 注意：如果发现图像上下或左右颠倒，可以开启这里的 flopping 参数
+    # 例如：optimizer.load_solution_from_2d_tensor(clean_path, k=4, v_flopping=True)
+    optimizer.load_solution_from_2d_tensor(clean_path, k=4)
+
+    # =================================================================
+    # 6. 输出最终对比结果
+    # =================================================================
+    print("\n" + "="*50)
+    print("✨ 评估完成！基于旧三角形网格计算出的 TreeTOp 结构指标：")
+    vf, compliance, max_stress = optimizer.print_metrics()
+    print("="*50)
+    print("\n请查收你的最终对比结果！")
+    
+    # (可选) 删掉临时文件，保持目录干净
+    import os
+    if os.path.exists(clean_path):
+        os.remove(clean_path)

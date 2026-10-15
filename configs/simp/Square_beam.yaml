@@ -1,0 +1,25 @@
+name: Square_beam
+meshfile: test_problems/Square_beam.msh
+
+Lx: 1.0
+Ly: 1.0
+Nx: 65
+Ny: 65
+
+fixed_x:
+  - [0.0, [0.0, 1.0]]
+fixed_y:
+  - [1.0, 0.0]
+fixed_xy: []
+
+loads:
+  - [[0.0, 1.0], [0.0, -0.0025]]
+
+vol_frac: 0.4
+
+filter_sigma: 0.5
+load_region_eps_x: 0.03
+load_region_eps_y: 0.03
+
+d2f_Lx: 0.5
+d2f_Ly: 0.5

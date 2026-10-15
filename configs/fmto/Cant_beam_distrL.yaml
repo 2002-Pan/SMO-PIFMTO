@@ -1,0 +1,246 @@
+params:
+  problem_name: Cantilever_beam_distributed_load
+  comment: 5 step Adamw
+  method: fm_nn_heaviside
+  top_opt_method: CombinedMappingDecoderSDF
+  penal: 3
+  sigmoid_limits: false
+  shape_combination: true
+  splitting: false
+  merging: false
+  dens_interval: 40
+  dens_offset: 0
+  dens_start_iter: 40
+  cleaning_interval: 10
+  cleaning_offset: 5
+  merging_markers:
+  - 200
+  merging_adaptation: 1
+  init_scale:
+  - 0.26377780083082325
+
+  - 0.19923402023100528
+
+  - 0.14380215614617523
+
+  - 0.1487402462378885
+
+  - 0.09788576898222599
+  - 0.3076038696220081
+  init_rotation:
+  - -36.55890168187044
+ 
+  - 3.888877526325197
+ 
+  - 21.243836672835943
+  
+  - 68.59372720002489
+ 
+  - -62.582211016489154
+  - 1.482812238049218
+  axis_offset: 0.0
+  shape_optimization_ranges:
+  - - 40
+    - 400
+  refactoring_markers: []
+  volfrac: 0.5
+  volfrac_increment: 0.16
+  volfrac_increment_marker: 20
+  volfrac_increment_duration: 40
+  smooth_k: 15
+  N_cap: 6
+  N_g: 6
+  N_g_x: 6
+  N_g_y: 1
+  max_iter: 120
+  config_name: VAE_DeepSDF_quad
+  saved_model_name: frst_VAE_DeepSDF_quad_Bprec
+  config_dir: ../configs/model
+  input_dim: 10
+  dataset_type: quadrangle
+  merging_marker: 10
+  merging_adaptation_length: 10
+  compliance_w: 14000000000
+  ks_smooth_factor: 60
+  volfrac_w: 4000000
+  gaussian_overlap_w: 0
+  gaussian_overlap_scale: 1.3
+  rc_loss_w: 100000
+  reopen_enable: true
+  reopen_start_iter: 30
+  reopen_patience: 5
+  reopen_improve_thresh: 0.015
+  reopen_cooldown: 8
+  reopen_adaptation: 5
+  reopen_offset_step: 0.23
+  reopen_scale_shrink: 0.5
+  reopen_use_canonical_shape_without_prior: true
+  reopen_force_zero_rotation_without_prior: true
+  reopen_canonicalize_old_feature_shapes: true
+  reopen_old_feature_canonical_blend: 0.4
+  reopen_old_feature_offset_canonical_blend: 0.9
+  reopen_direction_mode_without_prior: 8way
+  reopen_direction_probe_scale: 1.0
+  init_centers_x:
+  - 0.03362189430604434
+  
+  - 0.20768949576086326
+  
+  - 0.2299665856229302
+  
+  - 0.381596999542422
+
+  - 0.7947324525141907
+  - 0.8406444859335305
+  init_centers_y:
+  - 0.2533430881273812
+  
+  - 0.125192455615178
+  
+  - 0.46522311718042136
+  
+  - 0.13216035323425096
+ 
+  - 0.4283298947227714
+  - 0.15385770941730048
+  init_chis:
+  - - 0.38013692047188713
+    - 0.2889598484972828
+    - 0.18173075152854146
+    - 0.41871009750482646
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+
+  - - 0.18354348826135017
+    - 0.16862879066252068
+    - -0.6694620192383104
+    - -0.6638928892896824
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+
+  - - 0.4598228984618984
+    - 0.0796775807646344
+    - -0.612454601124072
+    - -0.43175620839183787
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+
+  - - 0.11917581313631895
+    - 1.7871850852307167
+    - -1.2290411003481116
+    - 1.6367469132770225
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+
+  - - 0.769836019384677
+    - 0.10102639729457415
+    - -0.5840727381311296
+    - -0.20583179251295133
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+  - - 0.4924760141237021
+    - 1.134501655439227
+    - -1.2432073859505228
+    - -0.5106396316227676
+    - 0.05
+    - 0.05
+    - 0.05
+    - 0.05
+  init_split_confidence:
+  - 0.14144799779756936
+
+  - 0.23516145394744836
+
+  - 0.1504397166652537
+
+  - 0.11458566837181397
+  - 0.337725902758158
+
+  - 0.19986051425354937
+  init_split_direction_x:
+  - -0.023929540788427565
+
+  - -0.9493901861243631
+
+  - -0.9538287281280173
+
+  - -0.8175454370562101
+
+  - 0.20765951685256936
+  - -0.8458147025383425
+  init_split_direction_y:
+  - 0.9997136475399618
+
+  - -0.31409914754858403
+
+  - 0.30035105692787045
+
+  - -0.5758640971171676
+  - 0.5974802976855684
+
+  - -0.5334767932815593
+  init_split_distance_prior:
+  - 0.08819578492389629
+
+  - 0.05973703414585181
+
+  - 0.048616213621873725
+
+  - 0.125
+
+  - 0.039340866406311265
+  - 0.125
+  init_split_bimodal_score:
+  - 0.0
+
+  - 0.07438016528925617
+
+  - 0.0
+
+  - 0.0
+
+  - 0.05882352941176472
+  - 0.0
+  init_split_neck_score:
+  - 0.4713728622630673
+
+  - 0.6166292845322179
+
+  - 0.3439446018240009
+
+  - 0.29724406779663326
+
+  - 0.217687575187136
+  - 0.586715838265526
+  init_split_anisotropy_score:
+  - 0.0007227823729840654
+
+  - 0.4084120494416107
+
+  - 0.9451267223610686
+
+  - 0.50824896065648
+  - 1.0
+
+  - 0.47691525547783153
+  init_split_gray_score:
+  - 0.0
+
+  - 0.0
+
+  - 0.0
+
+  - 0.0
+
+  - 0.5
+  - 0.0

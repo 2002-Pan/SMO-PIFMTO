@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated paper and the upstream JAX-FEM and NHSDF works."
+title: "Prior-Informed Feature-Mapped Topology Optimization with Latent Feature Relaxation and Adaptive Feature-Space Reopening"
+type: software
+version: 0.1.0-staging
+date-released: 2026-10-15
+authors:
+  - family-names: Pan
+    given-names: Feiyang
+  - family-names: Xiao
+    given-names: Peng
+  - family-names: Yin
+    given-names: Chunyan
+  - family-names: Dou
+    given-names: Guangbin

@@ -1,0 +1,198 @@
+params:
+  problem_name: Square_cantilever_beam
+  comment: 5 step Adamw
+  method: fm_nn_heaviside
+  top_opt_method: CombinedMappingDecoderSDF
+  penal: 3
+  sigmoid_limits: false
+  shape_combination: true
+  splitting: false
+  merging: false
+  dens_interval: 40
+  dens_offset: 0
+  dens_start_iter: 40
+  cleaning_interval: 10
+  cleaning_offset: 5
+  merging_markers:
+  - 200
+  merging_adaptation: 1
+  axis_offset: 0.2
+
+  scale_max: 3.0
+  scale_min: 0.05
+
+  shape_optimization_ranges:
+  - - 40
+    - 400
+  refactoring_markers: []
+  volfrac: 0.40
+  volfrac_increment: 0.00
+  volfrac_increment_marker: 20
+  volfrac_increment_duration: 40
+  smooth_k: 15
+  N_cap: 4
+  N_g: 2
+  N_g_x: 1
+  N_g_y: 2
+  max_iter: 200
+  config_name: VAE_DeepSDF_quad
+  saved_model_name: frst_VAE_DeepSDF_quad_Bprec
+  config_dir: ../configs/model
+  input_dim: 10
+  dataset_type: quadrangle
+  merging_marker: 10
+  merging_adaptation_length: 10
+  compliance_w: 40000
+  volfrac_w: 1000000
+  ks_smooth_factor: 60
+  treshold: 0.5
+  gaussian_overlap_w: 0
+  gaussian_overlap_scale: 1.3
+  rc_loss_w: 100000
+  image_size: 3
+  init_scale:
+  - 0.2
+  - 0.2
+  
+
+  init_rotation:
+  - 0
+  - 0
+  
+
+  # init_scale:
+  # - 0.5538561
+  # - 0.17979011
+  # - 0.26301533
+  # - 0.7674482
+  # - 0.1066417
+  # - 0.79254645
+  # init_centers_x:
+  # - 0.10140401
+  # - 0.56568805
+  # - 0.6228655
+  # - 0.68078583
+  # - 0.7526645
+  # - 0.7550887
+
+  # init_centers_y:
+  # - 0.47057468
+  # - 0.42069338
+  # - 0.6850503
+  # - 0.2620883
+  # - 0.4903706
+  # - 1.1644081
+
+  # init_rotation:
+  # - -22.60528
+  # - -30.78158
+  # - 41.55132
+  # - 16.23123
+  # - 41.74033
+  # - 24.06933
+  # init_chis:
+  #   - - 0.689816773
+  #     - -0.22093609
+  #     - -0.039878547
+  #     - 0.812954187 
+  #     - 0.032226305 
+  #     - 0.011568941 
+  #     - 0.098878011 
+  #     - 0.04146485
+  #   - - 0.220879346 
+  #     - 0.157743216 
+  #     - -0.39754197 
+  #     - -0.099652886  
+  #     - 0.032619093 
+  #     - 0.01652395  
+  #     - 0.224160865 
+  #     - 0.081449315
+  #   - - 0.371845961 
+  #     - -0.08393158 
+  #     - -0.414118946  
+  #     - -0.242662892  
+  #     - 0.005287062 
+  #     - 0.092256226 
+  #     - 0.085926414 
+  #     - -0.00416801
+  #   - - 0.530694842 
+  #     - 0.496677846 
+  #     - 0.174510211 
+  #     - 0.160603479 
+  #     - 0.110263839 
+  #     - 0.103497677 
+  #     - 0.003791016 
+  #     - 0.027507121
+  #   - - 0.665179849 
+  #     - 1.126611948 
+  #     - -0.734637201  
+  #     - 0.662459135 
+  #     - 0.08692266  
+  #     - 0.10594485  
+  #     - 0.126040176 
+  #     - 0.05159121
+  #   - - 0.871010065 
+  #     - 0.252652884 
+  #     - -1.058197021  
+  #     - 0.113112018 
+  #     - 0.090655833 
+  #     - 0.279045552 
+  #     - 0.178296417 
+  #     - 0.121243425
+
+  init_split_confidence:
+  - 0.22129054520358865
+  - 0.21100646183502642
+  # - 0.21100646183502653
+  # - 0.26149626607286913
+  # - 0.525
+  # - 0.26149626607286913
+  # init_split_direction_x:
+  # - 0.0
+  # - -0.873164115627989
+  # - -0.873164115627989
+  # - -0.961191430290592
+  # - 1.0
+  # - -0.961191430290592
+  # init_split_direction_y:
+  # - 1.0
+  # - -0.48742633000238295
+  # - 0.48742633000238295
+  # - -0.27588228347598936
+  # - 0.0
+  # - 0.2758822834759895
+  # init_split_distance_prior:
+  # - 0.125
+  # - 0.08085758817362439
+  # - 0.0808575881736244
+  # - 0.125
+  # - 0.01720147291280323
+  # - 0.125
+  # init_split_bimodal_score:
+  # - 0.09126984126984128
+  # - 0.07407407407407407
+  # - 0.07407407407407407
+  # - 0.0
+  # - 1.0
+  # - 0.0
+  # init_split_neck_score:
+  # - 0.28260869565217384
+  # - 0.4379227740179893
+  # - 0.4379227740179896
+  # - 0.7049875535762304
+  # - 0.0
+  # - 0.7049875535762304
+  # init_split_anisotropy_score:
+  # - 0.0
+  # - 1.0
+  # - 1.0
+  # - 1.0
+  # - 0.0
+  # - 1.0
+  # init_split_gray_score:
+  # - 0.0
+  # - 0.0
+  # - 0.0
+  # - 0.0
+  # - 0.5
+  # - 0.0

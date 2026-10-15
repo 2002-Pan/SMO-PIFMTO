@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# Generated optimization artifacts
+artifacts/
+data/
+outputs/
+results/
+logs/
+checkpoints/
+rejected_candidates/
+*.vtu
+*.vtk
+*.log
+
+# Notebook state
+.ipynb_checkpoints/
+
+# Large experimental datasets and trained agents
+topology_dataset_v1/
+topology_dataset_v2/
+rl_models/
+data_extruded_3d/
