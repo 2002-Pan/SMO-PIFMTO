@@ -6,12 +6,8 @@ Adaptive Feature-Space Reopening.”** It contains the smallest practical subset
 identified from the local JAX-FEM and NHSDF development trees.
 
 > **Staging status:** the source selection, paths, model, five benchmark meshes,
-> and configurations are present. This is not yet a publication-ready release:
-> the two bridge variants must be validated, a full pipeline reproduction must
-> be completed, and a project-level license must be chosen after upstream
-> permissions are confirmed.
+> and configurations are present. 
 
-The original projects were not modified.
 
 ## Pipeline
 
